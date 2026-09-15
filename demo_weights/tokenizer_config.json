@@ -1,0 +1,11 @@
+{
+  "vocab_size": 703,
+  "special_tokens": [
+    "<unk>",
+    "<s>",
+    "</s>",
+    "<im_start>",
+    "<im_end>"
+  ],
+  "chat_template": "im_start"
+}
