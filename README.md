@@ -9,8 +9,9 @@
 ```
 tokens → [Prelude × P] → [Recurrent Block × T 圈] → [Coda × C] → logits
                           ↑__________↓
-          h_{t+1} = A·h_t + B·e + Block(RMSNorm(h_t + e)) + LoRA_t(·)
 ```
+
+$$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + \mathrm{LoRA}_t(h_t + e)$$
 
 工程链路完整，支持 AMP、DDP 多卡训练、断点续训，权重格式与 HuggingFace 生态兼容。
 
@@ -45,13 +46,11 @@ tokens → [Prelude × P] → [Recurrent Block × T 圈] → [Coda × C] → log
 
 每圈更新公式：
 
-```
-h_{t+1} = A · h_t + B · e + Block(RMSNorm(h_t + e)) + LoRA_t(h_t + e)
-```
+$$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + \mathrm{LoRA}_t(h_t + e)$$
 
 | 机制 | 实现要点 | 开关 |
 |---|---|---|
-| **LTI 稳定注入** | `A = exp(−exp(log_dt + log_A))`，ρ(A)<1 由参数化构造保证，不依赖训练约束 | 恒开 |
+| **LTI 稳定注入** | $A = \exp\big(-\exp(\log d_t + \log A)\big)$，$\rho(A) < 1$ 由参数化构造保证，不依赖训练约束 | 恒开 |
 | **输入注入 e** | Prelude 输出固定，每圈重新注入，防止隐状态随圈数漂移 | 恒开 |
 | **圈数正弦嵌入** | 类 RoPE 编码作用于循环维度 D/8 的通道，让同一套权重在不同深度执行不同功能 | 恒开 |
 | **深度 LoRA** | 跨圈共享低秩矩阵，每圈独立 scale 向量；推理圈数超过训练值时 clamp 到最后一圈（深度外推） | 恒开 |
