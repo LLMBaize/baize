@@ -33,8 +33,6 @@ FFN：稠密 SwiGLU，或 MoE（top-K 路由 + 共享专家 + aux-loss 均衡）
    支持 batch_size > 1 的批量推理。
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -111,6 +109,20 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+def causal_attention(q, k, v, dropout_p=0.0):
+    """带因果 mask 的 SDPA，兼容 KV cache。
+    q : [B, H, T, d]，k/v : [B, H, S, d]，S = 已缓存长度 + T。
+    query i 的绝对位置为 S - T + i，只能看到 key j <= S - T + i。
+    """
+    T, S = q.shape[-2], k.shape[-2]
+    if T == 1:
+        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+    if T == S:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=dropout_p)
+    mask = torch.ones(T, S, dtype=torch.bool, device=q.device).tril(diagonal=S - T)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p)
+
+
 # ---------------------------------------------------------------------------
 # 注意力：GQA（默认）/ MLA（可选）
 # ---------------------------------------------------------------------------
@@ -155,15 +167,7 @@ class GQAAttention(nn.Module):
         k = repeat_kv(k, self.n_rep).transpose(1, 2)
         v = repeat_kv(v, self.n_rep).transpose(1, 2)
 
-        if seq_len > 1 and kv_cache is None:
-            out = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True,
-                dropout_p=self.dropout if self.training else 0.0,
-            )
-        else:
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = F.softmax(scores.float(), dim=-1).type_as(q)
-            out = torch.matmul(scores, v)
+        out = causal_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0)
         out = out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(out)
 
@@ -224,12 +228,7 @@ class MLAttention(nn.Module):
         k = torch.cat([k_nope, k_rope], dim=-1)
 
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        if seq_len > 1 and kv_cache is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.q_head_dim)
-            scores = F.softmax(scores.float(), dim=-1).type_as(q)
-            out = torch.matmul(scores, v)
+        out = causal_attention(q, k, v)
         out = out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(out)
 
@@ -299,23 +298,20 @@ class MoEFFN(nn.Module):
 
         y = torch.zeros_like(x_flat)
         # 用 unique_consecutive 分组（排序后同专家连续）
-        _, counts = torch.unique_consecutive(flat_expert_idx, return_counts=True)
+        # 注意：expert_ids 只含实际出现的专家，必须用它而不是 enumerate 下标取专家
+        expert_ids, counts = torch.unique_consecutive(flat_expert_idx, return_counts=True)
+        expert_ids, counts = expert_ids.tolist(), counts.tolist()
         offset = 0
-        for expert_id, cnt in enumerate(counts.tolist()):
-            if cnt == 0:
-                if self.training:
-                    # DDP：让未路由专家也接入计算图
-                    y[0, 0] += 0 * sum(p.sum() for p in self.experts[expert_id].parameters())
-                continue
+        for expert_id, cnt in zip(expert_ids, counts):
             tok_ids = flat_token_idx[offset: offset + cnt]
             w = flat_weight[offset: offset + cnt].unsqueeze(-1)   # [cnt, 1]
             out_e = self.experts[expert_id](x_flat[tok_ids])       # [cnt, H]
             y.index_add_(0, tok_ids, (out_e * w).to(y.dtype))
             offset += cnt
 
-        # 未出现的专家（counts 只含出现的）：DDP 梯度保护
+        # 未出现的专家：DDP 梯度保护
         if self.training:
-            appeared = set(flat_expert_idx.unique().tolist())
+            appeared = set(expert_ids)
             for eid in range(self.n_experts):
                 if eid not in appeared:
                     y[0, 0] += 0 * sum(p.sum() for p in self.experts[eid].parameters())
@@ -418,6 +414,7 @@ class RecurrentBlock(nn.Module):
         self.act = ACTHalting(config.hidden_size)
         self.lora = LoRAAdapter(config.hidden_size, config.lora_rank, config.max_loop_iters)
         self.loop_dim = max(2, int(config.hidden_size * config.loop_emb_frac))
+        self.aux_loss = None
 
     def forward(self, h, e, cos, sin, n_loops=None, kv_cache=None):
         n_loops = n_loops or self.config.max_loop_iters
@@ -426,12 +423,14 @@ class RecurrentBlock(nn.Module):
         halted = torch.zeros(bsz, seq_len, device=h.device, dtype=torch.bool)
         cumulative_p = torch.zeros(bsz, seq_len, device=h.device)
         h_out = torch.zeros_like(h)
+        aux_losses = []
 
         for t in range(n_loops):
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             x = self.norm(h_loop + e)
             f = self.attn(self.attn_norm(x), cos, sin, kv_cache, cache_key=f"rec_{t}_attn")
             f = f + self.ffn(self.ffn_norm(x))
+            aux_losses.append(self.ffn.aux_loss)  # 每圈的 aux_loss 都计入，而非只留最后一圈
             f = f + self.lora(f, t)
             h = self.injection(h, e, f)
 
@@ -439,7 +438,9 @@ class RecurrentBlock(nn.Module):
                 p = self.act(h)
                 still_running = (~halted).float()
                 remainder = (1.0 - cumulative_p).clamp(min=0)
-                weight = torch.where(cumulative_p + p >= self.config.act_threshold, remainder, p)
+                # 最后一圈仍未停机的位置把剩余概率全部补上，保证各圈权重之和为 1
+                stop_now = (cumulative_p + p >= self.config.act_threshold) | (t == n_loops - 1)
+                weight = torch.where(stop_now, remainder, p)
                 weight = weight * still_running
                 h_out = h_out + weight.unsqueeze(-1) * h
                 cumulative_p = cumulative_p + p * still_running
@@ -449,6 +450,7 @@ class RecurrentBlock(nn.Module):
             else:
                 h_out = h
 
+        self.aux_loss = torch.stack(aux_losses).mean()
         return h_out
 
 
@@ -541,8 +543,11 @@ class BaiZeForCausalLM(PreTrainedModel, GenerationMixin):
         hidden = self.model(input_ids, kv_cache=kv_cache, start_pos=start_pos, n_loops=n_loops)
         logits = self.lm_head(hidden)
         loss = None
-        ffn = self.model.recurrent.ffn
-        aux_loss = ffn.aux_loss if isinstance(ffn, MoEFFN) and ffn.aux_loss is not None else logits.new_zeros(1).squeeze()
+        # aux_loss：循环块（各圈平均）+ Prelude/Coda 中的 MoE 层
+        aux_loss = self.model.recurrent.aux_loss
+        for layer in list(self.model.prelude) + list(self.model.coda):
+            if isinstance(layer.ffn, MoEFFN):
+                aux_loss = aux_loss + layer.ffn.aux_loss
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

@@ -45,21 +45,21 @@ class PretrainDataset(Dataset):
                         ids.extend(tokenizer.encode(line))
                         ids.append(tokenizer.eos_token_id)
         self.data = ids
-        self.n_samples = max(1, len(self.data) // (seq_len + 1))
+        self.n_samples = max(1, len(self.data) // seq_len)
         Logger(f"预训练语料: {len(self.data):,} tokens → {self.n_samples:,} 个样本(seq_len={seq_len})")
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, i):
-        start = (i * (self.seq_len + 1)) % max(1, len(self.data) - self.seq_len - 1)
-        chunk = self.data[start : start + self.seq_len + 1]
-        if len(chunk) < self.seq_len + 1:
-            chunk = chunk + [0] * (self.seq_len + 1 - len(chunk))
-        return (
-            torch.tensor(chunk[:-1], dtype=torch.long),
-            torch.tensor(chunk[1:], dtype=torch.long),
-        )
+        # 注意：BaiZeForCausalLM.forward 内部会做 next-token shift，
+        # 这里 input_ids 与 labels 必须对齐返回，否则会错位两次（变成预测 t+2）
+        start = i * self.seq_len
+        chunk = self.data[start : start + self.seq_len]
+        n_pad = self.seq_len - len(chunk)
+        input_ids = torch.tensor(chunk + [0] * n_pad, dtype=torch.long)
+        labels = torch.tensor(chunk + [-100] * n_pad, dtype=torch.long)  # padding 不计 loss
+        return input_ids, labels
 
 
 def main():
