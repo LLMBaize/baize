@@ -11,6 +11,7 @@ BaiZe 指令微调（SFT）。
 """
 
 import argparse
+import glob
 import json
 import math
 import os
@@ -33,20 +34,25 @@ from baize.trainer_utils import (
 
 
 class SFTDataset(Dataset):
-    def __init__(self, path, tokenizer, max_length):
+    """读取一个或多个 jsonl 对话文件；max_samples 在读取循环中截断有效样本数。"""
+
+    def __init__(self, files, tokenizer, max_length, max_samples=None):
         self.samples = []
         skipped = 0
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                messages = json.loads(line)["messages"]
-                input_ids, labels = tokenizer.encode_chat(messages, max_length)
-                if sum(1 for t in labels if t != -100) < 2:
-                    skipped += 1
-                    continue
-                self.samples.append((input_ids, labels))
+        for path in files:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if max_samples is not None and len(self.samples) >= max_samples:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    messages = json.loads(line)["messages"]
+                    input_ids, labels = tokenizer.encode_chat(messages, max_length)
+                    if sum(1 for t in labels if t != -100) < 2:
+                        skipped += 1
+                        continue
+                    self.samples.append((input_ids, labels))
         Logger(f"SFT 样本: {len(self.samples)} 条（跳过无效 {skipped} 条）")
 
     def __len__(self):
@@ -69,7 +75,10 @@ def collate_fn(batch, pad_id=0):
 
 def main():
     parser = argparse.ArgumentParser(description="BaiZe SFT")
-    parser.add_argument("--data", type=str, default="data/sft.jsonl")
+    parser.add_argument("--data", type=str, default="data/sft.jsonl",
+                        help="SFT jsonl 文件 glob，可用逗号分隔多个")
+    parser.add_argument("--max_samples", type=int, default=None, help="最多使用多少条有效对话（控制数据量）")
+    parser.add_argument("--max_steps", type=int, default=None, help="最多训练多少个优化步（控制训练量）")
     parser.add_argument("--tokenizer", type=str, default="tokenizer")
     parser.add_argument("--save_dir", type=str, default="out")
     parser.add_argument("--save_weight", type=str, default="sft")
@@ -125,12 +134,17 @@ def main():
     autocast_ctx = torch.autocast(device_type=device_type, dtype=dtype) if device_type == "cuda" else torch.autocast(device_type="cpu", enabled=False)
     scaler = build_scaler(enabled=(args.dtype == "float16"))
 
-    train_ds = SFTDataset(args.data, tokenizer, args.max_seq_len)
+    files = sorted(f for pat in args.data.split(",") for f in glob.glob(pat.strip()))
+    if not files:
+        raise FileNotFoundError(f"未找到 SFT 数据: {args.data}")
+    train_ds = SFTDataset(files, tokenizer, args.max_seq_len, max_samples=args.max_samples)
     sampler = torch.utils.data.distributed.DistributedSampler(train_ds) if dist.is_initialized() else None
     loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, shuffle=(sampler is None),
                         collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True, drop_last=True)
     iters_per_epoch = math.ceil(len(loader) / args.accumulation_steps)
     total_steps = args.epochs * iters_per_epoch
+    if args.max_steps is not None:
+        total_steps = min(total_steps, args.max_steps)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=0.01)
 

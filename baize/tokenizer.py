@@ -31,11 +31,14 @@ def train_bpe(
     vocab_size: int = 6400,
     save_dir: str = "tokenizer",
     min_frequency: int = 2,
+    texts=None,
 ):
     """在语料上训练 BPE 分词器并保存。
 
     Args:
         corpus_files: 文本文件路径列表（utf-8，纯文本，一行或多行均可）
+        texts:        可选，文档文本迭代器；给出时忽略 corpus_files，
+                      用于 jsonl 语料或只取部分数据训练
         vocab_size:   目标词表大小（含特殊符号）
         save_dir:     输出目录，写入 tokenizer.json 与 tokenizer_config.json
         min_frequency: BPE 合并的最小频次
@@ -54,7 +57,10 @@ def train_bpe(
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=True,
     )
-    tokenizer.train(corpus_files, trainer)
+    if texts is not None:
+        tokenizer.train_from_iterator(texts, trainer)
+    else:
+        tokenizer.train(corpus_files, trainer)
 
     os.makedirs(save_dir, exist_ok=True)
     tokenizer.save(os.path.join(save_dir, "tokenizer.json"))

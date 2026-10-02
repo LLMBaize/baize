@@ -19,20 +19,17 @@ import torch
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from baize import BaiZeConfig, BaiZeForCausalLM, BaiZeTokenizer
+from baize.data import iter_documents
 from baize.trainer_utils import load_weights
 
 
 @torch.inference_mode()
-def eval_ppl(model, tokenizer, files, device, seq_len=512, stride=256):
+def eval_ppl(model, tokenizer, files, device, seq_len=512, stride=256, max_docs=None):
     """滑动窗口困惑度（stride < seq_len，窗口重叠以覆盖长程依赖）。"""
     ids = []
-    for fp in files:
-        with open(fp, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    ids.extend(tokenizer.encode(line))
-                    ids.append(tokenizer.eos_token_id)
+    for text in iter_documents(files, max_docs=max_docs):
+        ids.extend(tokenizer.encode(text))
+        ids.append(tokenizer.eos_token_id)
     nll, count = 0.0, 0
     for i in range(0, len(ids) - seq_len, stride):
         chunk = torch.tensor(ids[i : i + seq_len + 1], dtype=torch.long, device=device).unsqueeze(0)
@@ -78,6 +75,7 @@ def main():
     parser.add_argument("--data", type=str, default="data/corpus*.txt")
     parser.add_argument("--tokenizer", type=str, default="tokenizer")
     parser.add_argument("--save_dir", type=str, default="out")
+    parser.add_argument("--max_docs", type=int, default=None, help="[ppl] 最多评估多少篇文档")
     parser.add_argument("--loops", type=int, default=None, help="推理循环圈数（可大于训练值做深度外推）")
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -97,9 +95,9 @@ def main():
     print(f"推理循环圈数: {args.loops or config.max_loop_iters}")
 
     if args.mode == "ppl":
-        files = sorted(glob.glob(args.data))
+        files = sorted(f for pat in args.data.split(",") for f in glob.glob(pat.strip()))
         assert files, f"未找到评估语料: {args.data}"
-        eval_ppl(model, tokenizer, files, args.device)
+        eval_ppl(model, tokenizer, files, args.device, max_docs=args.max_docs)
     else:
         chat(model, tokenizer, args.device, loops=args.loops, max_new_tokens=args.max_new_tokens)
 

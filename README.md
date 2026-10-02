@@ -25,6 +25,7 @@ $$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + 
 - [环境安装](#环境安装)
 - [快速开始（5 步）](#快速开始5-步)
 - [推理 demo](#推理-demo)
+- [使用 AllenAI 数据](#使用-allenai-数据)
 - [训练参数详解](#训练参数详解)
 - [RDT 训练建议](#rdt-训练建议)
 - [目录结构](#目录结构)
@@ -149,6 +150,9 @@ SFT 数据放在 `data/sft.jsonl`，每行一个 JSON 对象：
 ```
 支持 `system` 角色，也支持多轮对话（多个 user/assistant 交替）。
 
+> 想用真实规模的数据？见 [使用 AllenAI 数据](#使用-allenai-数据)：一条命令即可从 C4/mC4、
+> OLMo 预训练混合、Tulu 3 SFT 等数据集按比例、按数据量抽取语料。
+
 ### 步骤 2：训练 BPE 分词器
 
 ```bash
@@ -255,13 +259,51 @@ python scripts/demo.py --web --port 8080
 
 ---
 
+## 使用 AllenAI 数据
+
+`scripts/prepare_allenai.py` 从 HuggingFace **流式**读取 AllenAI 的预训练 / 后训练数据集，
+按权重混合、过滤，读够配额即停（不会整库下载），输出 jsonl 供各训练脚本直接使用。
+需要额外安装 `pip install datasets`。
+
+```bash
+python scripts/prepare_allenai.py --list          # 查看内置数据源
+
+# 预训练：mC4 中文 70% + C4 英文 30%，共 15 亿字符，另留 2000 篇验证集
+python scripts/prepare_allenai.py --task pretrain --sources c4-zh:0.7,c4-en:0.3 \
+    --max_chars 1_500_000_000 --val_docs 2000 --out data/allenai_pretrain.jsonl
+
+# 后训练：Tulu 3 SFT mixture 抽 5 万条
+python scripts/prepare_allenai.py --task sft --sources tulu3 --max_docs 50000 \
+    --out data/allenai_sft.jsonl
+
+# 训练时还可再截断：
+python scripts/pretrain.py --data data/allenai_pretrain.jsonl --max_tokens 1_000_000_000 --max_steps 20000
+python scripts/sft.py --data data/allenai_sft.jsonl --max_samples 30000
+```
+
+| 环节 | 数据量控制参数 |
+|---|---|
+| 下载 `prepare_allenai.py` | `--max_docs` / `--max_tokens` / `--max_chars`（按 `--sources` 权重分配）、`--max_scan`、`--val_docs`、`--skip` |
+| 分词器 `train_tokenizer.py` | `--max_docs` |
+| 预训练 `pretrain.py` | `--max_docs` / `--max_tokens` / `--max_steps` |
+| SFT `sft.py` | `--max_samples` / `--max_steps` |
+| 评估 `eval.py` | `--max_docs` |
+
+下载哪些数据集、推荐配比、数据量估算、过滤参数、许可等完整说明见
+**[docs/allenai_data.md](docs/allenai_data.md)**。
+
+---
+
 ## 训练参数详解
 
 ### pretrain.py / sft.py 通用参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--data` | `data/corpus*.txt` | 语料 glob（pretrain）或 jsonl 路径（sft） |
+| `--data` | `data/corpus*.txt` | 语料 glob（pretrain：.txt 每行一篇或 .jsonl 的 text 字段；sft：jsonl），逗号分隔多个 |
+| `--max_steps` | 不限 | 最多训练多少个优化步（与 epochs 取较小者） |
+| `--max_docs` / `--max_tokens` | 不限 | [pretrain] 读入语料的文档数 / token 数上限 |
+| `--max_samples` | 不限 | [sft] 使用的有效对话条数上限 |
 | `--tokenizer` | `tokenizer` | 分词器目录 |
 | `--save_dir` | `out` | 权重输出目录 |
 | `--epochs` | 2 / 3 | 训练轮数 |
@@ -360,8 +402,10 @@ BaiZe/
 │   ├── config.py              # BaiZeConfig（HF PretrainedConfig）
 │   ├── model.py               # RDT 模型：GQA/MLA、MoE、LTI、ACT、LoRA、圈数嵌入
 │   ├── tokenizer.py           # BPE 训练 + 封装（含对话模板，v2 精确边界定位）
+│   ├── data.py                # 语料读取（.txt / .jsonl，支持数据量截断）
 │   └── trainer_utils.py       # LR schedule / DDP / 日志 / 权重 IO
 ├── scripts/
+│   ├── prepare_allenai.py     # AllenAI 预训练 / SFT 数据流式下载、混合、过滤、配额控制
 │   ├── train_tokenizer.py     # BPE 分词器训练
 │   ├── pretrain.py            # 预训练（AMP / DDP / 断点续训 / MoE / ACT）
 │   ├── sft.py                 # 指令微调（prompt mask / 多轮对话）
@@ -376,6 +420,9 @@ BaiZe/
 ├── data/
 │   ├── corpus.txt             # 预训练语料（示例）
 │   └── sft.jsonl              # SFT 数据（示例）
+├── docs/
+│   └── allenai_data.md        # AllenAI 数据接入说明（下载哪些数据、数据量控制）
+├── tests/                     # 回归测试（python tests/test_*.py）
 └── requirements.txt
 ```
 

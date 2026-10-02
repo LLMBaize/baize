@@ -6,11 +6,13 @@ BaiZe 预训练（next-token LM）。
     python scripts/pretrain.py --data data/corpus.txt
     torchrun --nproc_per_node=2 scripts/pretrain.py --data data/corpus.txt
 
-数据：纯文本文件，文档以空行分隔；内部打包为固定长度 seq_len 的样本。
+数据：.txt（每个非空行一篇）或 .jsonl（"text" 字段，如 prepare_allenai.py 的输出）；
+内部打包为固定长度 seq_len 的样本。--max_docs / --max_tokens 控制读入的数据量。
 """
 
 import argparse
 import glob
+from array import array
 import math
 import os
 import sys
@@ -25,6 +27,7 @@ from torch.utils.data import DataLoader, Dataset
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from baize import BaiZeConfig, BaiZeForCausalLM, BaiZeTokenizer
+from baize.data import iter_documents
 from baize.trainer_utils import (
     Logger, build_scaler, get_lr, init_distributed_mode, is_main_process,
     load_weights, log_model_params, save_weights, setup_seed,
@@ -32,21 +35,27 @@ from baize.trainer_utils import (
 
 
 class PretrainDataset(Dataset):
-    """把语料打包成 (input_ids, labels) 定长样本。"""
+    """把语料打包成 (input_ids, labels) 定长样本。
 
-    def __init__(self, files, tokenizer, seq_len):
+    max_docs / max_tokens 在读取循环中截断数据量（None 表示全部读入）。
+    token 以 uint32 紧凑存储，1 亿 token 约占 400MB 内存。
+    """
+
+    def __init__(self, files, tokenizer, seq_len, max_docs=None, max_tokens=None):
         self.seq_len = seq_len
-        ids = []
-        for fp in files:
-            with open(fp, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        ids.extend(tokenizer.encode(line))
-                        ids.append(tokenizer.eos_token_id)
+        ids = array("I")
+        n_docs = 0
+        for text in iter_documents(files, max_docs=max_docs):
+            ids.extend(tokenizer.encode(text))
+            ids.append(tokenizer.eos_token_id)
+            n_docs += 1
+            if max_tokens is not None and len(ids) >= max_tokens:
+                del ids[max_tokens:]
+                break
         self.data = ids
         self.n_samples = max(1, len(self.data) // seq_len)
-        Logger(f"预训练语料: {len(self.data):,} tokens → {self.n_samples:,} 个样本(seq_len={seq_len})")
+        Logger(f"预训练语料: {n_docs:,} 篇 / {len(self.data):,} tokens → "
+               f"{self.n_samples:,} 个样本(seq_len={seq_len})")
 
     def __len__(self):
         return self.n_samples
@@ -55,7 +64,7 @@ class PretrainDataset(Dataset):
         # 注意：BaiZeForCausalLM.forward 内部会做 next-token shift，
         # 这里 input_ids 与 labels 必须对齐返回，否则会错位两次（变成预测 t+2）
         start = i * self.seq_len
-        chunk = self.data[start : start + self.seq_len]
+        chunk = self.data[start : start + self.seq_len].tolist()
         n_pad = self.seq_len - len(chunk)
         input_ids = torch.tensor(chunk + [0] * n_pad, dtype=torch.long)
         labels = torch.tensor(chunk + [-100] * n_pad, dtype=torch.long)  # padding 不计 loss
@@ -64,7 +73,11 @@ class PretrainDataset(Dataset):
 
 def main():
     parser = argparse.ArgumentParser(description="BaiZe Pretrain")
-    parser.add_argument("--data", type=str, default="data/corpus*.txt")
+    parser.add_argument("--data", type=str, default="data/corpus*.txt",
+                        help="语料 glob，支持 .txt（每行一篇）与 .jsonl（text 字段），可用逗号分隔多个")
+    parser.add_argument("--max_docs", type=int, default=None, help="最多读入多少篇文档（控制数据量）")
+    parser.add_argument("--max_tokens", type=int, default=None, help="最多读入多少 token（控制数据量）")
+    parser.add_argument("--max_steps", type=int, default=None, help="最多训练多少个优化步（控制训练量）")
     parser.add_argument("--tokenizer", type=str, default="tokenizer")
     parser.add_argument("--save_dir", type=str, default="out")
     parser.add_argument("--save_weight", type=str, default="pretrain")
@@ -134,15 +147,18 @@ def main():
     autocast_ctx = torch.autocast(device_type=device_type, dtype=dtype) if device_type == "cuda" else torch.autocast(device_type="cpu", enabled=False)
     scaler = build_scaler(enabled=(args.dtype == "float16"))
 
-    files = sorted(glob.glob(args.data))
+    files = sorted(f for pat in args.data.split(",") for f in glob.glob(pat.strip()))
     if not files:
         raise FileNotFoundError(f"未找到语料: {args.data}")
-    train_ds = PretrainDataset(files, tokenizer, args.max_seq_len)
+    train_ds = PretrainDataset(files, tokenizer, args.max_seq_len,
+                               max_docs=args.max_docs, max_tokens=args.max_tokens)
     sampler = torch.utils.data.distributed.DistributedSampler(train_ds) if dist.is_initialized() else None
     loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
                         num_workers=args.num_workers, pin_memory=True, drop_last=True)
     iters_per_epoch = math.ceil(len(loader) / args.accumulation_steps)
     total_steps = args.epochs * iters_per_epoch
+    if args.max_steps is not None:
+        total_steps = min(total_steps, args.max_steps)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=0.01)
 
