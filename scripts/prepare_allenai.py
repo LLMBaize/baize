@@ -17,6 +17,10 @@
     python scripts/prepare_allenai.py --task sft \
         --sources tulu3 --max_docs 50000 --out data/allenai_sft.jsonl
 
+    # 偏好对齐（DPO）：Tulu 3 偏好数据 2 万对
+    python scripts/prepare_allenai.py --task dpo \
+        --sources tulu3-pref --max_docs 20000 --out data/allenai_dpo.jsonl
+
     # 查看所有内置数据源
     python scripts/prepare_allenai.py --list
 """
@@ -91,6 +95,16 @@ SFT_PRESETS = {
     # ---- 真实用户对话（含大量中文；可用 --language Chinese 过滤）----
     "wildchat": dict(path="allenai/WildChat-1M", messages_field="conversation",
                      desc="WildChat-1M 真实用户与 ChatGPT 对话（有 language 字段）"),
+}
+
+DPO_PRESETS = {
+    # ---- 偏好数据（chosen / rejected 两条完整对话）----
+    "tulu3-pref": dict(path="allenai/llama-3.1-tulu-3-8b-preference-mixture",
+                       desc="Tulu 3 偏好混合（Llama-3.1-Tulu-3-8B DPO 用，~27 万对）"),
+    "tulu3-pref-olmo2": dict(path="allenai/olmo-2-1124-7b-preference-mix",
+                             desc="OLMo 2 7B DPO 使用的偏好混合"),
+    "ultrafeedback": dict(path="allenai/ultrafeedback_binarized_cleaned", split="train_prefs",
+                          desc="UltraFeedback 二值化清洗版（~6 万对）"),
 }
 
 VALID_ROLES = {"system", "user", "assistant"}
@@ -185,22 +199,14 @@ def clean_pretrain(example, src, args):
     return text
 
 
-def clean_sft(example, src, args):
-    """返回规范化的 messages 列表，或 None（被过滤）。"""
-    if args.language and "language" in example and example["language"] != args.language:
-        return None
-    if example.get("toxic") is True:  # WildChat 自带的毒性标注
-        return None
-    if args.source_filter:
-        source = str(example.get("source", ""))
-        if not any(s in source for s in args.source_filter):
-            return None
-
-    raw = example.get(src.get("messages_field", args.messages_field))
+def normalize_messages(raw):
+    """规范化对话：只保留 system/user/assistant，去掉末尾非 assistant 轮次；不合法返回 None。"""
     if not isinstance(raw, list):
         return None
     messages = []
     for m in raw:
+        if not isinstance(m, dict):
+            return None
         role, content = m.get("role"), m.get("content")
         if role not in VALID_ROLES or not isinstance(content, str) or not content.strip():
             return None  # 含工具调用等非标准轮次的对话整条丢弃
@@ -210,12 +216,66 @@ def clean_sft(example, src, args):
         messages.pop()
     if not any(m["role"] == "user" for m in messages):
         return None
+    return messages
+
+
+def _meta_filters_pass(example, args):
+    if args.language and "language" in example and example["language"] != args.language:
+        return False
+    if example.get("toxic") is True:  # WildChat 自带的毒性标注
+        return False
+    if args.source_filter:
+        source = str(example.get("source", ""))
+        if not any(s in source for s in args.source_filter):
+            return False
+    return True
+
+
+def clean_sft(example, src, args):
+    """返回规范化的 messages 列表，或 None（被过滤）。"""
+    if not _meta_filters_pass(example, args):
+        return None
+    messages = normalize_messages(example.get(src.get("messages_field", args.messages_field)))
+    if messages is None:
+        return None
     if args.max_turns > 0 and sum(m["role"] == "assistant" for m in messages) > args.max_turns:
         return None
     if args.min_cjk_ratio > 0:
         if cjk_ratio("".join(m["content"] for m in messages)) < args.min_cjk_ratio:
             return None
     return messages
+
+
+def clean_dpo(example, src, args):
+    """返回 {"chosen": messages, "rejected": messages}，两者共享相同的 prompt 前缀；或 None。
+
+    兼容两种格式：chosen/rejected 为完整对话列表（Tulu 3 / UltraFeedback），
+    或 prompt 为字符串、chosen/rejected 为回复字符串。
+    """
+    if not _meta_filters_pass(example, args):
+        return None
+    pair = {}
+    for side in ("chosen", "rejected"):
+        raw = example.get(side)
+        if isinstance(raw, str):
+            prompt = example.get("prompt")
+            if not isinstance(prompt, str):
+                return None
+            raw = [{"role": "user", "content": prompt}, {"role": "assistant", "content": raw}]
+        msgs = normalize_messages(raw)
+        if msgs is None:
+            return None
+        pair[side] = msgs
+    if pair["chosen"][:-1] != pair["rejected"][:-1]:  # prompt 必须一致，只有最后一条回复不同
+        return None
+    if pair["chosen"][-1]["content"] == pair["rejected"][-1]["content"]:
+        return None
+    if args.max_turns > 0 and sum(m["role"] == "assistant" for m in pair["chosen"]) > args.max_turns:
+        return None
+    if args.min_cjk_ratio > 0:
+        if cjk_ratio("".join(m["content"] for m in pair["chosen"])) < args.min_cjk_ratio:
+            return None
+    return pair
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +292,7 @@ def split_budget(total, sources):
 
 
 def prepare(args, stream_fn=open_stream):
-    presets = PRETRAIN_PRESETS if args.task == "pretrain" else SFT_PRESETS
+    presets = {"pretrain": PRETRAIN_PRESETS, "sft": SFT_PRESETS, "dpo": DPO_PRESETS}[args.task]
     sources = parse_sources(args.sources, presets)
     if args.max_tokens is not None and not args.tokenizer:
         raise ValueError("--max_tokens 需要 --tokenizer 来统计 token 数（或改用 --max_docs / --max_chars）")
@@ -266,7 +326,7 @@ def prepare(args, stream_fn=open_stream):
 
     rng = random.Random(args.seed)
     seen = set()
-    clean = clean_pretrain if args.task == "pretrain" else clean_sft
+    clean = {"pretrain": clean_pretrain, "sft": clean_sft, "dpo": clean_dpo}[args.task]
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     val_path = os.path.splitext(args.out)[0] + ".val.jsonl"
@@ -323,10 +383,15 @@ def prepare(args, stream_fn=open_stream):
                 record = {"text": item, "source": src["key"]}
                 n_chars = len(item)
                 n_tokens = len(tokenizer.encode(item)) + 1 if tokenizer else 0
-            else:
+            elif args.task == "sft":
                 record = {"messages": item, "source": src["key"]}
                 n_chars = sum(len(m["content"]) for m in item)
                 n_tokens = len(tokenizer.encode(tokenizer.build_chat(item))) if tokenizer else 0
+            else:
+                record = {"chosen": item["chosen"], "rejected": item["rejected"], "source": src["key"]}
+                n_chars = sum(len(m["content"]) for m in item["chosen"]) + len(item["rejected"][-1]["content"])
+                n_tokens = (len(tokenizer.encode(tokenizer.build_chat(item["chosen"])))
+                            + len(tokenizer.encode(tokenizer.build_chat(item["rejected"])))) if tokenizer else 0
             line = json.dumps(record, ensure_ascii=False) + "\n"
 
             # ---- 先填满验证集，不计入训练配额 ----
@@ -376,9 +441,9 @@ def prepare(args, stream_fn=open_stream):
 def build_parser():
     p = argparse.ArgumentParser(description="下载并混合 AllenAI 预训练 / 后训练数据",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--task", choices=["pretrain", "sft"], default="pretrain")
+    p.add_argument("--task", choices=["pretrain", "sft", "dpo"], default="pretrain")
     p.add_argument("--sources", type=str, default=None,
-                   help="数据源及权重，如 c4-zh:0.7,c4-en:0.3；默认 pretrain=c4-zh,c4-en / sft=tulu3")
+                   help="数据源及权重，如 c4-zh:0.7,c4-en:0.3；默认 pretrain=c4-zh,c4-en / sft=tulu3 / dpo=tulu3-pref")
     p.add_argument("--out", type=str, default=None,
                    help="输出 jsonl；默认 data/allenai_<task>.jsonl")
     p.add_argument("--list", action="store_true", help="列出内置数据源后退出")
@@ -399,10 +464,10 @@ def build_parser():
     f.add_argument("--min_chars", type=int, default=50, help="[pretrain] 文档最少字符数")
     f.add_argument("--max_doc_chars", type=int, default=0, help="[pretrain] 单篇文档截断长度，0=不截断")
     f.add_argument("--min_cjk_ratio", type=float, default=0.0, help="中文字符占比下限，如 0.3 只留中文为主的样本")
-    f.add_argument("--language", type=str, default=None, help="[sft] 按样本的 language 字段过滤，如 Chinese")
+    f.add_argument("--language", type=str, default=None, help="[sft/dpo] 按样本的 language 字段过滤，如 Chinese")
     f.add_argument("--source_filter", type=str, nargs="*", default=None,
-                   help="[sft] 只保留 source 字段包含这些子串的样本（Tulu 3 mixture 适用）")
-    f.add_argument("--max_turns", type=int, default=0, help="[sft] 最多 assistant 轮数，0=不限")
+                   help="[sft/dpo] 只保留 source 字段包含这些子串的样本（Tulu 3 mixture 适用）")
+    f.add_argument("--max_turns", type=int, default=0, help="[sft/dpo] 最多 assistant 轮数，0=不限")
     f.add_argument("--dedup", type=int, default=1, choices=[0, 1], help="精确去重")
     f.add_argument("--text_field", type=str, default="text")
     f.add_argument("--messages_field", type=str, default="messages")
@@ -414,7 +479,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.list:
         for title, presets in (("预训练（--task pretrain）", PRETRAIN_PRESETS),
-                               ("后训练 SFT（--task sft）", SFT_PRESETS)):
+                               ("后训练 SFT（--task sft）", SFT_PRESETS),
+                               ("偏好对齐 DPO（--task dpo）", DPO_PRESETS)):
             print(f"\n{title}")
             for k, v in presets.items():
                 loc = v["path"] + (f"#{v['name']}" if v.get("name") else "") + \
@@ -422,7 +488,7 @@ def main(argv=None):
                 print(f"  {k:<24} {v['desc']}\n  {'':<24} {loc}")
         return
     if args.sources is None:
-        args.sources = "c4-zh,c4-en" if args.task == "pretrain" else "tulu3"
+        args.sources = {"pretrain": "c4-zh,c4-en", "sft": "tulu3", "dpo": "tulu3-pref"}[args.task]
     if args.out is None:
         args.out = f"data/allenai_{args.task}.jsonl"
     prepare(args)

@@ -53,6 +53,11 @@ def test_kv_cache_causal_mla():
     _check_kv_cache_consistency("mla")
 
 
+def expert_ref(moe, i, x):
+    """逐专家参考实现：SwiGLU(x) = down(silu(x·Wg) * (x·Wu))。"""
+    return (torch.nn.functional.silu(x @ moe.w_gate[i]) * (x @ moe.w_up[i])) @ moe.w_down[i]
+
+
 def test_moe_routes_to_selected_experts():
     torch.manual_seed(0)
     cfg = small_config()
@@ -72,7 +77,7 @@ def test_moe_routes_to_selected_experts():
         ref = moe.shared_experts(flat).clone()
         for n in range(flat.shape[0]):
             for j in range(idx.shape[1]):
-                ref[n] += w[n, j] * moe.experts[idx[n, j].item()](flat[n])
+                ref[n] += w[n, j] * expert_ref(moe, idx[n, j].item(), flat[n])
         assert idx[0].tolist() == [1, 2] or sorted(idx[0].tolist()) == [1, 2]
         assert torch.allclose(out, ref, atol=1e-6), (out - ref).abs().max()
 
@@ -85,6 +90,7 @@ def test_aux_loss_covers_all_loops_and_moe_layers():
     expected = model.model.recurrent.aux_loss
     for layer in list(model.model.prelude) + list(model.model.coda):
         expected = expected + layer.ffn.aux_loss
+    expected = expected + model.config.act_ponder_coef * model.model.recurrent.ponder_cost
     assert torch.allclose(out.aux_loss, expected)
     assert out.aux_loss.item() > model.model.recurrent.aux_loss.item()
 

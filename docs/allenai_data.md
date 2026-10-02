@@ -1,13 +1,15 @@
 # 使用 AllenAI 数据训练 BaiZe
 
-本文说明如何把 AllenAI（Ai2）开源的**预训练数据**（C4 / mC4、OLMo 2 预训练混合、Dolmino）
-和**后训练数据**（Tulu 3 SFT、WildChat）接入 BaiZe，以及如何在每个环节**控制数据量**。
+本文说明如何把 AllenAI（Ai2）开源的**预训练数据**（C4 / mC4、OLMo 2 预训练混合、Dolmino）、
+**后训练数据**（Tulu 3 SFT、WildChat）和**偏好数据**（Tulu 3 / OLMo 2 偏好混合、UltraFeedback）接入 BaiZe，
+以及如何在每个环节**控制数据量**。
 
 整个流程分两步：
 
 1. `scripts/prepare_allenai.py`：从 HuggingFace **流式**读取数据集，按比例混合、过滤，
    读够配额即停止，写出本地 `jsonl`。
-2. `train_tokenizer.py` / `pretrain.py` / `sft.py` / `eval.py`：直接读取这些 `jsonl`，
+2. `train_tokenizer.py` / `sft.py` / `dpo.py` / `eval.py` 直接读取这些 `jsonl`；预训练语料先用
+   `tokenize_corpus.py` 预分词成 `.bin`（memmap，不占内存），`pretrain.py` 直接读 `.bin`。
    训练时还可以再用 `--max_docs` / `--max_tokens` / `--max_samples` / `--max_steps` 截断数据量。
 
 > **流式读取**：数据不会整库下载。脚本读一条、处理一条，配额用完就停，
@@ -60,7 +62,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 > ⚠️ OLMo-mix 和 Dolmino 的 **config 名称以 HuggingFace 数据集页面为准**
 > （这些仓库会更新，例如更新的 Dolma 3 / OLMo 3 数据）。
 > 如果某个预设报 `BuilderConfig ... not found` 之类的错误，脚本会跳过这个数据源，其它数据源照常继续。
-> 这时去数据集页面查到正确的 config 名或文件路径，用自定义写法替换，见 2.3。
+> 这时去数据集页面查到正确的 config 名或文件路径，用自定义写法替换，见 2.4。
 >
 > `allenai/dolma` 本体使用的是旧版加载脚本，新版 `datasets` 不再支持，所以没有内置。
 > 需要 Dolma 时，请用 OLMo-mix（Dolma 系列的后续版本），或参考 Dolma 官方工具链。
@@ -84,7 +86,23 @@ Tulu 3 以英文为主。想要中文对话能力时，可以这样组合：
 --sources tulu3,wildchat --min_cjk_ratio 0.3
 ```
 
-### 2.3 自定义数据源（不在内置列表里的数据集）
+### 2.3 偏好数据（`--task dpo`，供 `scripts/dpo.py` 使用）
+
+| 预设名 | HF 数据集 | 规模（约） | 说明 |
+|---|---|---|---|
+| `tulu3-pref` | `allenai/llama-3.1-tulu-3-8b-preference-mixture` | 27 万对 | **Tulu 3 偏好混合，首选** |
+| `tulu3-pref-olmo2` | `allenai/olmo-2-1124-7b-preference-mix` | — | OLMo 2 7B DPO 使用的版本 |
+| `ultrafeedback` | `allenai/ultrafeedback_binarized_cleaned`（split `train_prefs`） | 6 万对 | UltraFeedback 清洗版 |
+
+输出每行 `{"chosen": [对话], "rejected": [对话]}`。清洗规则：
+- 两条对话的 prompt（除最后一条 assistant 回复外的所有轮次）必须完全一致，否则丢弃；
+- chosen 与 rejected 回复相同的样本丢弃；
+- 也接受 `{"prompt": "...", "chosen": "...", "rejected": "..."}` 的字符串格式，会自动转成对话。
+
+`--language` / `--source_filter` / `--min_cjk_ratio` / `--max_turns` 同样适用（按 chosen 计算）。
+偏好数据一般 1 万到 5 万对就够小模型用；DPO 学习率要很小（默认 1e-6），只训 1 个 epoch。
+
+### 2.4 自定义数据源（不在内置列表里的数据集）
 
 `--sources` 除了预设名，也可以直接写 HF 仓库：
 
@@ -151,9 +169,10 @@ SFT 数据还会自动规范化：
 | 脚本 | 参数 | 说明 |
 |---|---|---|
 | `train_tokenizer.py` | `--max_docs` | 只用前 N 篇训练分词器（几十万篇就足以得到稳定的词表） |
-| `pretrain.py` | `--max_docs` / `--max_tokens` | 读入语料时截断 |
-| `pretrain.py` / `sft.py` | `--max_steps` | 最多训练多少个优化步，与 `--epochs` 取两者中较小的 |
-| `sft.py` | `--max_samples` | 最多使用多少条有效对话 |
+| `tokenize_corpus.py` | `--max_docs` / `--max_tokens` | 预分词时截断 |
+| `pretrain.py` | `--max_docs` / `--max_tokens` | 读入语料时截断（`.bin` 只支持 `--max_tokens`） |
+| `pretrain.py` / `sft.py` / `dpo.py` | `--max_steps` | 最多训练多少个优化步，与 `--epochs` 取两者中较小的 |
+| `sft.py` / `dpo.py` | `--max_samples` | 最多使用多少条有效对话 / 偏好对 |
 | `eval.py` | `--max_docs` | PPL 评估只用前 N 篇 |
 
 `--data` / `--corpus` 都支持 `.txt`（每行一篇）和 `.jsonl`（`text` 字段），
@@ -175,7 +194,8 @@ BaiZe 默认配置在 17M~40M 参数之间，循环块共享权重，但每一�
 - BPE 词表 6400 时，中文大约 **1~1.5 个汉字一个 token**，英文大约 **3~4 个字符一个 token**。
 - 写出的 `jsonl` 体积约等于字符数乘每字符字节数：中文每字约 3 字节，英文每字符约 1 字节。
 - 以上只是粗略估计，**以 manifest 中实际统计的数字为准**。
-- `pretrain.py` 把 token 以 uint32 存在内存里，每 1 亿 token 约占 400MB。
+- 文本语料直接喂 `pretrain.py` 时 token 存在内存里（每 1 亿 token 约 400MB）；
+  大语料请先 `tokenize_corpus.py` 转成 `.bin`（词表 < 65536 时每 token 2 字节，memmap 读取不占内存）。
 
 SFT 一般 **2 万到 10 万条**就够了。注意，超过 `--max_seq_len`（默认 512）的对话会被截断；
 如果截断后回复部分少于 2 个 token，这条对话会被跳过。
@@ -198,9 +218,10 @@ python scripts/prepare_allenai.py --task pretrain \
 python scripts/train_tokenizer.py --corpus data/allenai_pretrain.jsonl \
     --max_docs 300000 --vocab_size 16000 --save_dir tokenizer
 
-# ③ 预训练：最多读入 10 亿 token，最多训练 2 万步
-python scripts/pretrain.py --data data/allenai_pretrain.jsonl \
-    --max_tokens 1_000_000_000 --max_steps 20000 --epochs 1
+# ③ 预分词成 memmap（只需一次），再预训练：最多用 10 亿 token，最多训练 2 万步
+python scripts/tokenize_corpus.py --data data/allenai_pretrain.jsonl --tokenizer tokenizer \
+    --out data/pretrain.bin --max_tokens 1_000_000_000
+python scripts/pretrain.py --data data/pretrain.bin --max_steps 20000 --epochs 1
 
 # ④ 后训练数据：Tulu 3 + WildChat 中文，共 5 万条，外加 500 条验证集
 python scripts/prepare_allenai.py --task sft \
@@ -211,9 +232,15 @@ python scripts/prepare_allenai.py --task sft \
 python scripts/sft.py --data "data/allenai_sft.jsonl,data/sft.jsonl" \
     --from_weight pretrain --max_samples 50000
 
-# ⑥ 在验证集上算困惑度
+# ⑥ 偏好对齐（可选）：Tulu 3 偏好数据 2 万对
+python scripts/prepare_allenai.py --task dpo --sources tulu3-pref --max_docs 20000 \
+    --out data/allenai_dpo.jsonl
+python scripts/dpo.py --data data/allenai_dpo.jsonl --from_weight sft
+
+# ⑦ 在验证集上算困惑度，并跑标准评测（ARC 也是 AllenAI 的数据集）
 python scripts/eval.py --weight pretrain --mode ppl \
     --data data/allenai_pretrain.val.jsonl --max_docs 2000
+python scripts/eval.py --weight dpo --mode bench --bench arc-easy,arc-challenge,ceval --chat 1
 ```
 
 已经有分词器时，下载阶段也可以直接按 token 精确控制：
@@ -228,7 +255,8 @@ python scripts/prepare_allenai.py --task pretrain --sources c4-zh \
 ```bash
 python scripts/prepare_allenai.py --task pretrain --sources c4-zh \
     --max_chars 500_000_000 --skip 3000000 --out data/allenai_pretrain_part2.jsonl
-python scripts/pretrain.py --data "data/allenai_pretrain*.jsonl"
+python scripts/tokenize_corpus.py --data data/allenai_pretrain_part2.jsonl --out data/pretrain_part2.bin
+python scripts/pretrain.py --data "data/pretrain*.bin"
 ```
 
 ### 输出格式
@@ -238,6 +266,9 @@ python scripts/pretrain.py --data "data/allenai_pretrain*.jsonl"
 {"text": "文档全文（可含换行）", "source": "c4-zh"}
 // SFT：data/allenai_sft.jsonl（与原 data/sft.jsonl 格式兼容）
 {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}], "source": "tulu3"}
+// DPO：data/allenai_dpo.jsonl
+{"chosen": [{"role": "user", ...}, {"role": "assistant", "content": "更好的回答"}],
+ "rejected": [{"role": "user", ...}, {"role": "assistant", "content": "较差的回答"}], "source": "tulu3-pref"}
 ```
 
 ---

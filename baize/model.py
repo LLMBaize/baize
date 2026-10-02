@@ -6,7 +6,7 @@ BaiZe — Recurrent-Depth Transformer 模型
     tokens → [Prelude × P] → [Recurrent Block × T 圈] → [Coda × C] → logits
 
 循环块单圈更新：
-    h_{t+1} = A · h_t + B · e + Transformer(RMSNorm(h_t + e)) + LoRA_t(·)
+    h_{t+1} = A · h_t + B · e + Transformer(RMSNorm(h_t + e)) + LoRA_t(RMSNorm(h_t + e))
 
 其中
     e     — Prelude 输出，冻结，每圈注入（防漂移）
@@ -33,9 +33,12 @@ FFN：稠密 SwiGLU，或 MoE（top-K 路由 + 共享专家 + aux-loss 均衡）
    支持 batch_size > 1 的批量推理。
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
@@ -256,11 +259,13 @@ class FeedForward(nn.Module):
 class MoEFFN(nn.Module):
     """细粒度 MoE：top-K 路由专家 + 常开共享专家 + aux-loss 负载均衡。
 
-    v2 改动（性能关键）：
-        原版逐专家 for 循环（O(n_experts) 次 forward）改为
-        scatter/gather 批量路由：把选中当前专家的 token 聚合成一批做矩阵乘，
-        再 scatter_add 回原位置，只需 n_experts 次矩阵乘但规模更小且可并行。
-        对于 n_experts=8 的小配置，实测训练步骤吞吐提升约 1.4×。
+    专家权重合并存成 [E, ...] 张量，路由后把 token 按专家装进 [E, C, H] 缓冲区，
+    用 3 次 bmm 一次算完所有专家：没有逐专家的 Python 循环和 GPU→CPU 同步，
+    所有专家参数每步都参与计算（DDP/FSDP 无需"未路由专家"的梯度兜底）。
+
+    容量 C：
+        moe_capacity_factor <= 0 —— C = 本批最忙专家的 token 数，不丢 token（一次同步取 max）
+        moe_capacity_factor > 0  —— C = ceil(cf · N·k / E)，超出容量的 token 被丢弃（无同步，形状固定）
     """
 
     def __init__(self, config: BaiZeConfig):
@@ -268,62 +273,88 @@ class MoEFFN(nn.Module):
         self.config = config
         self.n_experts = config.n_experts
         self.topk = config.n_experts_per_tok
-        self.gate = nn.Linear(config.hidden_size, config.n_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [FeedForward(config, config.moe_intermediate_size) for _ in range(config.n_experts)]
-        )
-        self.shared_experts = FeedForward(config, config.moe_intermediate_size * config.n_shared_experts)
+        hidden, inter = config.hidden_size, config.moe_intermediate_size
+        self.gate = nn.Linear(hidden, config.n_experts, bias=False)
+        self.w_gate = nn.Parameter(torch.empty(config.n_experts, hidden, inter))
+        self.w_up = nn.Parameter(torch.empty(config.n_experts, hidden, inter))
+        self.w_down = nn.Parameter(torch.empty(config.n_experts, inter, hidden))
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.shared_experts = FeedForward(config, inter * config.n_shared_experts)
         self.aux_loss = None
+        self.reset_expert_parameters()
+
+    def reset_expert_parameters(self, std: float = 0.02):
+        for w in (self.w_gate, self.w_up, self.w_down):
+            nn.init.normal_(w, mean=0.0, std=std)
 
     def forward(self, x):
         bsz, seq_len, hidden = x.shape
-        x_flat = x.view(-1, hidden)           # [N, H]，N = bsz * seq_len
-        N = x_flat.shape[0]
+        x_flat = x.reshape(-1, hidden)        # [N, H]
+        N, E, k = x_flat.shape[0], self.n_experts, self.topk
 
-        scores = F.softmax(self.gate(x_flat), dim=-1)            # [N, E]
-        topk_weight, topk_idx = torch.topk(scores, k=self.topk, dim=-1, sorted=False)
+        scores = F.softmax(self.gate(x_flat), dim=-1, dtype=torch.float32)   # [N, E]
+        topk_weight, topk_idx = torch.topk(scores, k=k, dim=-1, sorted=False)
         topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
 
-        # ---------- scatter/gather 批量路由 ----------
-        # 展平成 (N * topk,) 的 token-expert 对
-        flat_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand_as(topk_idx).reshape(-1)  # [N*k]
-        flat_expert_idx = topk_idx.reshape(-1)   # [N*k]
-        flat_weight = topk_weight.reshape(-1)     # [N*k]
+        # ---- 把 (token, expert) 对按专家排序，计算每对在该专家缓冲区中的位置 ----
+        flat_expert = topk_idx.reshape(-1)                                     # [N*k]
+        flat_token = torch.arange(N, device=x.device).repeat_interleave(k)    # [N*k]
+        flat_weight = topk_weight.reshape(-1)
+        order = flat_expert.argsort(stable=True)
+        e_sorted, tok_sorted, w_sorted = flat_expert[order], flat_token[order], flat_weight[order]
+        counts = torch.bincount(flat_expert, minlength=E)                     # [E]
+        starts = counts.cumsum(0) - counts
+        pos = torch.arange(N * k, device=x.device) - starts[e_sorted]
 
-        # 按专家 id 排序（同一专家的 token 连续，批量矩阵乘更友好）
-        sort_idx = flat_expert_idx.argsort()
-        flat_token_idx = flat_token_idx[sort_idx]
-        flat_expert_idx = flat_expert_idx[sort_idx]
-        flat_weight = flat_weight[sort_idx]
+        cf = self.config.moe_capacity_factor
+        if cf > 0:
+            capacity = max(1, math.ceil(cf * N * k / E))
+            keep = pos < capacity
+            pos = torch.where(keep, pos, torch.full_like(pos, capacity))     # 溢出 token 写入丢弃槽
+            w_sorted = w_sorted * keep
+            n_slots = capacity + 1
+        else:
+            n_slots = int(counts.max())
 
-        y = torch.zeros_like(x_flat)
-        # 用 unique_consecutive 分组（排序后同专家连续）
-        # 注意：expert_ids 只含实际出现的专家，必须用它而不是 enumerate 下标取专家
-        expert_ids, counts = torch.unique_consecutive(flat_expert_idx, return_counts=True)
-        expert_ids, counts = expert_ids.tolist(), counts.tolist()
-        offset = 0
-        for expert_id, cnt in zip(expert_ids, counts):
-            tok_ids = flat_token_idx[offset: offset + cnt]
-            w = flat_weight[offset: offset + cnt].unsqueeze(-1)   # [cnt, 1]
-            out_e = self.experts[expert_id](x_flat[tok_ids])       # [cnt, H]
-            y.index_add_(0, tok_ids, (out_e * w).to(y.dtype))
-            offset += cnt
-
-        # 未出现的专家：DDP 梯度保护
-        if self.training:
-            appeared = set(expert_ids)
-            for eid in range(self.n_experts):
-                if eid not in appeared:
-                    y[0, 0] += 0 * sum(p.sum() for p in self.experts[eid].parameters())
+        # ---- dispatch → 批量专家计算 → combine ----
+        buf = x_flat.new_zeros(E, n_slots, hidden)
+        buf[e_sorted, pos] = x_flat[tok_sorted]
+        h = self.act_fn(torch.bmm(buf, self.w_gate.to(buf.dtype))) * torch.bmm(buf, self.w_up.to(buf.dtype))
+        expert_out = torch.bmm(h, self.w_down.to(h.dtype))                     # [E, C, H]
+        y_pairs = expert_out[e_sorted, pos] * w_sorted.unsqueeze(-1).to(expert_out.dtype)
+        y = torch.zeros_like(x_flat).index_add_(0, tok_sorted, y_pairs.to(x_flat.dtype))
 
         out = (y + self.shared_experts(x_flat)).view(bsz, seq_len, hidden)
 
         if self.training and self.config.router_aux_loss_coef > 0:
-            load = F.one_hot(topk_idx, self.n_experts).float().mean(0)   # f_i：路由频率 [E]
-            self.aux_loss = (load * scores.mean(0)).sum() * self.n_experts * self.config.router_aux_loss_coef
+            load = counts.float() / (N * k)                                   # f_i：路由频率 [E]
+            self.aux_loss = (load * scores.mean(0)).sum() * E * self.config.router_aux_loss_coef
         else:
-            self.aux_loss = scores.new_zeros(1).squeeze()
+            self.aux_loss = scores.new_zeros(())
         return out
+
+
+def convert_legacy_moe_state_dict(sd: dict) -> dict:
+    """旧版权重（experts.{i}.gate_proj/up_proj/down_proj）→ 合并后的 w_gate/w_up/w_down。"""
+    import re
+
+    pat = re.compile(r"^(.*\.ffn)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+    groups = {}
+    out = {}
+    for key, val in sd.items():
+        m = pat.match(key)
+        if m:
+            groups.setdefault(m.group(1), {}).setdefault(m.group(3), {})[int(m.group(2))] = val
+        else:
+            out[key] = val
+    names = {"gate_proj": "w_gate", "up_proj": "w_up", "down_proj": "w_down"}
+    for prefix, projs in groups.items():
+        for proj, experts in projs.items():
+            # nn.Linear 权重为 [out, in]，合并张量按 x @ W 存储为 [in, out]
+            out[f"{prefix}.{names[proj]}"] = torch.stack(
+                [experts[i].t() for i in sorted(experts)], dim=0
+            ).contiguous()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +375,7 @@ def loop_index_embedding(h: torch.Tensor, loop_t: int, loop_dim: int, theta: flo
 class LoRAAdapter(nn.Module):
     """深度 LoRA：跨圈共享 down/B，每圈一个 scale 向量。
 
-    delta_t(x) = (down(x) ⊙ scale[t]) @ B。推理圈数超过训练圈数时
+    delta_t(x) = (down(x) ⊙ scale[t]) @ B，x = RMSNorm(h_t + e)。推理圈数超过训练圈数时
     clamp 到最后一圈学到的 scale（深度外推）。
     """
 
@@ -395,9 +426,14 @@ class ACTHalting(nn.Module):
 class RecurrentBlock(nn.Module):
     """单个 TransformerBlock 循环 T 圈。
 
-    每圈：圈数嵌入 → norm(h+e) → block → +LoRA_t → LTI 更新 → ACT 累积。
+    每圈：圈数嵌入 → x = norm(h+e) → attn/ffn(x) + LoRA_t(x) → LTI 更新 → ACT 累积。
     输出为各圈隐状态按 ACT 权重加权和（use_act=False 时取最后一圈）。
     每圈独立 KV cache key（rec_{t}），解码时每圈深度各持有一份缓存。
+
+    ACT 相关：
+        act_init_bias（默认 -3）让初始停机概率很小（≈0.05），训练初期跑满所有圈，
+            由任务梯度决定何时提前停机（若初始化为 0，p≈0.5，两圈就会停，循环深度形同虚设）。
+        ponder cost（Graves 2016）：N(t) + R(t)，系数 act_ponder_coef，鼓励简单 token 少跑几圈。
     """
 
     def __init__(self, config: BaiZeConfig):
@@ -414,25 +450,38 @@ class RecurrentBlock(nn.Module):
         self.act = ACTHalting(config.hidden_size)
         self.lora = LoRAAdapter(config.hidden_size, config.lora_rank, config.max_loop_iters)
         self.loop_dim = max(2, int(config.hidden_size * config.loop_emb_frac))
+        self.grad_checkpointing = False
         self.aux_loss = None
+        self.ponder_cost = None
+        self.avg_loops = None  # 本次前向各位置实际循环圈数的均值（监控用）
+
+    def _loop_step(self, h, e, cos, sin, t: int, kv_cache=None):
+        h_loop = loop_index_embedding(h, t, self.loop_dim)
+        x = self.norm(h_loop + e)
+        f = self.attn(self.attn_norm(x), cos, sin, kv_cache, cache_key=f"rec_{t}_attn")
+        f = f + self.ffn(self.ffn_norm(x))
+        f = f + self.lora(x, t)                       # LoRA_t(RMSNorm(h_t + e))
+        return self.injection(h, e, f), self.ffn.aux_loss
 
     def forward(self, h, e, cos, sin, n_loops=None, kv_cache=None):
         n_loops = n_loops or self.config.max_loop_iters
         bsz, seq_len, _ = h.shape
+        use_ckpt = self.grad_checkpointing and self.training and kv_cache is None
 
         halted = torch.zeros(bsz, seq_len, device=h.device, dtype=torch.bool)
         cumulative_p = torch.zeros(bsz, seq_len, device=h.device)
+        n_updates = torch.zeros(bsz, seq_len, device=h.device)
+        remainders = torch.zeros(bsz, seq_len, device=h.device)
         h_out = torch.zeros_like(h)
         aux_losses = []
 
         for t in range(n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
-            x = self.norm(h_loop + e)
-            f = self.attn(self.attn_norm(x), cos, sin, kv_cache, cache_key=f"rec_{t}_attn")
-            f = f + self.ffn(self.ffn_norm(x))
-            aux_losses.append(self.ffn.aux_loss)  # 每圈的 aux_loss 都计入，而非只留最后一圈
-            f = f + self.lora(f, t)
-            h = self.injection(h, e, f)
+            if use_ckpt:
+                h, aux = torch.utils.checkpoint.checkpoint(
+                    self._loop_step, h, e, cos, sin, t, None, use_reentrant=False)
+            else:
+                h, aux = self._loop_step(h, e, cos, sin, t, kv_cache)
+            aux_losses.append(aux)  # 每圈的 aux_loss 都计入，而非只留最后一圈
 
             if self.config.use_act:
                 p = self.act(h)
@@ -440,17 +489,22 @@ class RecurrentBlock(nn.Module):
                 remainder = (1.0 - cumulative_p).clamp(min=0)
                 # 最后一圈仍未停机的位置把剩余概率全部补上，保证各圈权重之和为 1
                 stop_now = (cumulative_p + p >= self.config.act_threshold) | (t == n_loops - 1)
-                weight = torch.where(stop_now, remainder, p)
-                weight = weight * still_running
-                h_out = h_out + weight.unsqueeze(-1) * h
+                weight = torch.where(stop_now, remainder, p) * still_running
+                h_out = h_out + weight.unsqueeze(-1).to(h.dtype) * h
+                n_updates = n_updates + still_running
+                remainders = remainders + torch.where(stop_now, remainder, torch.zeros_like(remainder)) * still_running
                 cumulative_p = cumulative_p + p * still_running
-                halted = halted | (cumulative_p >= self.config.act_threshold)
-                if halted.all() and kv_cache is None:
+                halted = halted | stop_now
+                if kv_cache is None and halted.all():
                     break
             else:
                 h_out = h
+                n_updates = n_updates + 1
 
         self.aux_loss = torch.stack(aux_losses).mean()
+        # ponder cost = N + R：N 不可导（计数），R 对停机前各圈 p 的梯度为 -1
+        self.ponder_cost = (n_updates + remainders).mean() if self.config.use_act else h.new_zeros(())
+        self.avg_loops = n_updates.mean().detach()
         return h_out
 
 
@@ -511,13 +565,20 @@ class BaiZeModel(nn.Module):
         cos = cos.unsqueeze(0).unsqueeze(2).expand(bsz, -1, 1, -1)    # [B, T, 1, d]
         sin = sin.unsqueeze(0).unsqueeze(2).expand(bsz, -1, 1, -1)
 
+        use_ckpt = self.recurrent.grad_checkpointing and self.training and kv_cache is None
         for i, layer in enumerate(self.prelude):
-            x = layer(x, cos, sin, kv_cache, cache_key=f"prelude_{i}")
+            x = self._run_block(layer, x, cos, sin, kv_cache, f"prelude_{i}", use_ckpt)
         e = x  # 冻结注入信号
         x = self.recurrent(x, e, cos, sin, n_loops=n_loops, kv_cache=kv_cache)
         for i, layer in enumerate(self.coda):
-            x = layer(x, cos, sin, kv_cache, cache_key=f"coda_{i}")
+            x = self._run_block(layer, x, cos, sin, kv_cache, f"coda_{i}", use_ckpt)
         return self.norm(x)
+
+    @staticmethod
+    def _run_block(layer, x, cos, sin, kv_cache, key, use_ckpt):
+        if use_ckpt:
+            return torch.utils.checkpoint.checkpoint(layer, x, cos, sin, None, key, use_reentrant=False)
+        return layer(x, cos, sin, kv_cache, cache_key=key)
 
 
 class BaiZeForCausalLM(PreTrainedModel, GenerationMixin):
@@ -532,6 +593,15 @@ class BaiZeForCausalLM(PreTrainedModel, GenerationMixin):
         if self.config.tie_word_embeddings:
             self.model.embed_tokens.weight = self.lm_head.weight
         self.post_init()
+        # HF 默认初始化会把 Linear bias 置 0（停机概率 p≈0.5，两圈即停），这里改为可配置的负偏置
+        with torch.no_grad():
+            self.model.recurrent.act.halt.bias.fill_(self.config.act_init_bias)
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, MoEFFN):
+            module.reset_expert_parameters()
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -539,20 +609,28 @@ class BaiZeForCausalLM(PreTrainedModel, GenerationMixin):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
+    def enable_grad_checkpointing(self, enabled: bool = True):
+        """激活重计算：前向不保存 Prelude/Coda 各层与循环块每一圈的中间激活，反向时重算。
+        显存从 O(层数 + 圈数) 份激活降到每层/每圈只存输入，代价约多 1/3 计算量。"""
+        self.model.recurrent.grad_checkpointing = enabled
+
     def forward(self, input_ids, labels=None, kv_cache=None, start_pos=0, n_loops=None, **kwargs):
         hidden = self.model(input_ids, kv_cache=kv_cache, start_pos=start_pos, n_loops=n_loops)
         logits = self.lm_head(hidden)
         loss = None
-        # aux_loss：循环块（各圈平均）+ Prelude/Coda 中的 MoE 层
-        aux_loss = self.model.recurrent.aux_loss
+        # aux_loss = MoE 负载均衡（循环块各圈平均 + Prelude/Coda 的 MoE 层）+ ACT ponder cost
+        rec = self.model.recurrent
+        aux_loss = rec.aux_loss
         for layer in list(self.model.prelude) + list(self.model.coda):
             if isinstance(layer.ffn, MoEFFN):
                 aux_loss = aux_loss + layer.ffn.aux_loss
+        if self.training and self.config.use_act and self.config.act_ponder_coef > 0:
+            aux_loss = aux_loss + self.config.act_ponder_coef * rec.ponder_cost
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_logits.view(-1, shift_logits.size(-1)).float(),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
@@ -573,45 +651,45 @@ class BaiZeForCausalLM(PreTrainedModel, GenerationMixin):
     ):
         """自回归生成。n_loops 可设大于训练值以做深度外推。
 
-        v2 改动：repetition_penalty 改为逐样本处理，支持 batch_size > 1。
-        temperature <= 0 时走贪心解码（确定性输出，便于对比不同圈数）。
+        采样各步（repetition_penalty / top_k / top_p）均为整批向量化操作，支持 batch_size > 1；
+        已生成 eos 的样本后续固定填 eos。temperature <= 0 时走贪心解码。
         """
         kv_cache = {}
         bsz = input_ids.shape[0]
         prompt_len = input_ids.shape[1]
+        finished = torch.zeros(bsz, dtype=torch.bool, device=input_ids.device)
         if streamer:
             streamer.put(input_ids.cpu())
         for step in range(max_new_tokens):
             cur = input_ids if step == 0 else input_ids[:, -1:]
             start_pos = 0 if step == 0 else prompt_len + step - 1
-            logits = self.forward(cur, kv_cache=kv_cache, start_pos=start_pos, n_loops=n_loops).logits[:, -1, :]
+            logits = self.forward(cur, kv_cache=kv_cache, start_pos=start_pos, n_loops=n_loops).logits[:, -1, :].float()
             if temperature > 0:
                 logits = logits / temperature
-            # repetition_penalty：逐样本处理（v2 修复：原版硬编码 [0]）
             if repetition_penalty != 1.0:
-                for b in range(bsz):
-                    seen = torch.unique(input_ids[b])
-                    score = logits[b, seen]
-                    logits[b, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
+                score = logits.gather(1, input_ids)
+                score = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
+                logits = logits.scatter(1, input_ids, score)
             if top_k > 0:
-                for b in range(bsz):
-                    threshold = torch.topk(logits[b], top_k)[0][-1]
-                    logits[b][logits[b] < threshold] = -float("inf")
+                kth = torch.topk(logits, min(top_k, logits.shape[-1]), dim=-1).values[:, -1:]
+                logits = logits.masked_fill(logits < kth, -float("inf"))
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                cumprob = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                mask = cumprob - torch.softmax(sorted_logits, dim=-1) > top_p
-                sorted_logits[mask] = -float("inf")
+                probs_sorted = torch.softmax(sorted_logits, dim=-1)
+                mask = torch.cumsum(probs_sorted, dim=-1) - probs_sorted > top_p
+                sorted_logits = sorted_logits.masked_fill(mask, -float("inf"))
                 logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
             if temperature <= 0:
                 next_token = logits.argmax(dim=-1, keepdim=True)
             else:
-                probs = torch.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
+                next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
+            if eos_token_id is not None:
+                next_token = torch.where(finished.unsqueeze(-1), torch.full_like(next_token, eos_token_id), next_token)
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
             input_ids = torch.cat([input_ids, next_token], dim=-1)
             if streamer:
                 streamer.put(next_token.cpu())
-            if eos_token_id is not None and (next_token == eos_token_id).all():
+            if eos_token_id is not None and finished.all():
                 break
         if streamer:
             streamer.end()

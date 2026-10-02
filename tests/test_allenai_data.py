@@ -129,6 +129,24 @@ def test_wildchat_language_and_toxic_filter():
         assert len(rows) == 1 and rows[0]["messages"][0] == {"role": "user", "content": "你好"}
 
 
+def test_dpo_pairs_normalized_and_filtered():
+    conv = lambda a: [{"role": "user", "content": "问题"}, {"role": "assistant", "content": a}]
+    data = {"allenai/llama-3.1-tulu-3-8b-preference-mixture": [
+        {"chosen": conv("好回答"), "rejected": conv("差回答"), "source": "x"},
+        {"chosen": conv("相同"), "rejected": conv("相同")},                       # 两边相同 → 丢弃
+        {"chosen": conv("a"), "rejected": [{"role": "user", "content": "别的问题"},
+                                           {"role": "assistant", "content": "b"}]},  # prompt 不同 → 丢弃
+        {"prompt": "字符串问题", "chosen": "好", "rejected": "差"},               # 字符串格式
+    ]}
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "dpo.jsonl")
+        m = run(["--task", "dpo", "--sources", "tulu3-pref", "--max_docs", "10", "--out", out], data)
+        rows = read_jsonl(out)
+        assert len(rows) == 2 and m["sources"][0]["filtered"] == 2
+        assert rows[0]["chosen"][-1]["content"] == "好回答" and rows[0]["rejected"][-1]["content"] == "差回答"
+        assert rows[1]["chosen"][0] == {"role": "user", "content": "字符串问题"}
+
+
 def test_source_error_keeps_other_sources():
     def stream_fn(src, seed, shuffle_buffer, skip):
         if src["path"] == "allenai/olmo-mix-1124":

@@ -3,7 +3,7 @@
 > 白泽，上古神兽，晓天下万物之情理 —— 愿这个小模型也能循环深思。
 
 极简但**架构完整**的 **Recurrent-Depth Transformer（RDT）** 语言模型。
-覆盖从 BPE 分词器训练、预训练、指令微调到推理评估的完整链路，
+覆盖从 BPE 分词器训练、预训练、指令微调（SFT）、偏好对齐（DPO）到推理与标准评测的完整链路，
 单张消费级 GPU 即可跑通全流程。
 
 ```
@@ -11,16 +11,17 @@ tokens → [Prelude × P] → [Recurrent Block × T 圈] → [Coda × C] → log
                           ↑__________↓
 ```
 
-$$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + \mathrm{LoRA}_t(h_t + e)$$
+$$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + \mathrm{LoRA}_t\big(\mathrm{RMSNorm}(h_t + e)\big)$$
 
-工程链路完整，支持 AMP、DDP 多卡训练、断点续训，权重格式与 HuggingFace 生态兼容。
+工程链路完整：AMP、DDP / FSDP2 多卡、激活重计算、预分词 memmap 数据、可精确续训的断点，
+可直接接入 AllenAI 预训练 / SFT / 偏好数据，权重格式与 HuggingFace 生态兼容。
 
 ---
 
 ## 目录
 
 - [架构一览](#架构一览)
-
+- [v3 改动](#v3-改动)
 - [v2 优化改动](#v2-优化改动)
 - [环境安装](#环境安装)
 - [快速开始（5 步）](#快速开始5-步)
@@ -47,7 +48,7 @@ $$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + 
 
 每圈更新公式：
 
-$$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + \mathrm{LoRA}_t(h_t + e)$$
+$$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + \mathrm{LoRA}_t\big(\mathrm{RMSNorm}(h_t + e)\big)$$
 
 | 机制 | 实现要点 | 开关 |
 |---|---|---|
@@ -55,7 +56,7 @@ $$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + 
 | **输入注入 e** | Prelude 输出固定，每圈重新注入，防止隐状态随圈数漂移 | 恒开 |
 | **圈数正弦嵌入** | 类 RoPE 编码作用于循环维度 D/8 的通道，让同一套权重在不同深度执行不同功能 | 恒开 |
 | **深度 LoRA** | 跨圈共享低秩矩阵，每圈独立 scale 向量；推理圈数超过训练值时 clamp 到最后一圈（深度外推） | 恒开 |
-| **ACT 早停** | 按位置预测停机概率并加权累积隐状态，简单 token 提前停圈 | `use_act`（默认开） |
+| **ACT 早停** | 按位置预测停机概率并加权累积隐状态，简单 token 提前停圈；停机偏置初始化为 −3（初始跑满所有圈），ponder cost 鼓励学会早停 | `use_act`（默认开）、`act_init_bias`、`act_ponder_coef` |
 
 ### 注意力与 FFN 选项
 
@@ -68,12 +69,48 @@ $$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + 
 - `1`：Prelude/Coda 也改用 MoE
 
 循环块内部始终使用 MoE，是 RDT 论文中"宽度（专家）× 深度（圈数）"的核心假设。
+专家权重合并存储为 `[E, …]` 张量，路由后一次 `bmm` 算完所有专家；
+`moe_capacity_factor > 0` 时按容量丢弃溢出 token（形状固定、无 GPU→CPU 同步）。
 
 ---
 
+## v3 改动
 
+### 严重 bug 修复
+
+| 问题 | 后果 | 修复 |
+|---|---|---|
+| 预训练 labels 手动错位后模型内部又 shift 一次 | 预训练目标变成预测 t+2 | Dataset 返回对齐的 input/labels |
+| 带 KV cache 的 prefill 走无因果 mask 的手写 attention | 推理与训练分布不一致 | GQA/MLA 统一走带 mask 的 SDPA，兼容 cache 偏移 |
+| MoE 用 `enumerate` 下标当专家 id | 专家 0 未被选中时 token 被送错专家 | 批量 bmm 实现，按真实专家 id 路由 |
+| 循环块 aux-loss 只计最后一圈，Prelude/Coda MoE 未计 | 负载均衡失效 | 各圈平均 + 所有 MoE 层求和 |
+| ACT 跑满仍未停机时权重和 < 1 | 输出幅度偏小 | 最后一圈补齐剩余概率 |
+| ACT 停机偏置被 HF 初始化为 0（p≈0.5）；且一开始就启用 ACT 时后几圈得不到训练 | **名义 8 圈实际只跑 2~3 圈** | 偏置默认 −3 + ponder cost + 默认前 10% 步关闭 ACT 跑满所有圈 |
+| `save_weights` 先转 fp16 再去重 | tie 的 embedding 存两份 | 先去重再转换 |
+
+### 训练工程
+
+- **预分词 memmap 数据**：`scripts/tokenize_corpus.py` → `.bin`，训练时零拷贝读取，不占内存、启动零等待
+- **统一训练循环** `baize/trainer.py`（pretrain / sft / dpo 共用）：
+  - 线性 warmup + 余弦退火（`--warmup_steps`，默认总步数 1%）
+  - 可续训采样器：单卡也打乱；续训从中断处下一个 batch 精确继续（测试验证：中断续训与不中断结果一致）
+  - 续训在 `torch.compile` / DDP / FSDP 包装前加载，修复 `--use_compile` 下无法续训
+  - **FSDP2**（`--fsdp 1`）、**激活重计算**（`--grad_checkpoint 1`）、ACT 延后启用（`--act_start_step`）
+  - 梯度累积时跳过中间 micro-batch 的梯度同步；norm/bias 不做 weight decay；断点原子写入
+- `load_weights` 默认严格校验：形状不匹配 / 缺参数直接报错并列出参数名；自动兼容旧版逐专家 MoE 权重
+
+### 新功能
+
+- **DPO 偏好对齐**：`scripts/dpo.py`；`prepare_allenai.py --task dpo` 直接拉取 Tulu 3 / OLMo 2 / UltraFeedback 偏好数据
+- **标准评测**：`eval.py --mode bench`，支持 ARC、MMLU、C-Eval、HellaSwag、GSM8K 与本地 jsonl
+- `generate` 全批量向量化（repetition penalty / top-k / top-p），已结束样本固定填充 eos
+- 测试 `tests/`（39 项，含 DDP/FSDP 双进程、中断续训一致性）+ GitHub Actions CI；`demo_weights` 已用修复后的代码重训
+
+---
 
 ## v2 优化改动
+
+> 注：v2 的 MoE 路由与 `generate` 实现已在 v3 中被批量化版本替换，以下为历史说明。
 
 v2 在原版基础上修复了四处工程缺陷，不改变架构语义：
 
@@ -116,16 +153,18 @@ v2 在原版基础上修复了四处工程缺陷，不改变架构语义：
 pip install -r requirements.txt
 ```
 
-`requirements.txt` 最低依赖：
+`requirements.txt`：
 ```
-torch>=2.1
+torch>=2.6            # --fsdp 需要 FSDP2
 transformers>=4.40
 tokenizers>=0.19
-numpy
 safetensors
-# 可选：scripts/demo.py --web 需要
-# gradio>=4.0
+numpy
+datasets>=2.19        # 可选：AllenAI 数据下载、标准评测
+# gradio>=4.0         # 可选：demo.py --web
 ```
+
+运行测试：`for t in tests/test_*.py; do python $t; done`（CPU 即可，含 DDP/FSDP 双进程测试）。
 
 > **注意**：`bfloat16` AMP 需要 Ampere 及以上架构（A100/A10G/RTX 3090+）；
 > 旧 GPU 用 `--dtype float16` 或 `--dtype float32`。
@@ -168,17 +207,19 @@ python scripts/train_tokenizer.py \
 ### 步骤 3：预训练
 
 ```bash
-# 单卡（~40M 参数，消费级 GPU 数小时内可收敛）
-python scripts/pretrain.py \
-    --data "data/corpus*.txt" \
-    --epochs 2 \
-    --batch_size 8
+# 小语料：直接读文本
+python scripts/pretrain.py --data "data/corpus*.txt" --epochs 2 --batch_size 8
 
-# 多卡（torchrun，2 卡示例）
-torchrun --nproc_per_node=2 scripts/pretrain.py \
-    --data "data/corpus*.txt" \
-    --epochs 2 \
-    --batch_size 8
+# 大语料：先预分词成 memmap（只需一次），再训练
+python scripts/tokenize_corpus.py --data "data/corpus*.txt" --out data/pretrain.bin
+python scripts/pretrain.py --data data/pretrain.bin --epochs 1 --batch_size 32 --accumulation_steps 8
+
+# 多卡：DDP；模型大时加 FSDP 与激活重计算
+torchrun --nproc_per_node=2 scripts/pretrain.py --data data/pretrain.bin
+torchrun --nproc_per_node=8 scripts/pretrain.py --data data/pretrain.bin --fsdp 1 --grad_checkpoint 1
+
+# 中断后续训（从中断处的下一个 batch 继续）
+python scripts/pretrain.py --data data/pretrain.bin --from_resume 1
 ```
 
 训练权重保存至 `out/pretrain.safetensors`，断点文件为 `out/ckpt_pretrain.pt`。
@@ -197,6 +238,19 @@ python scripts/sft.py \
 
 SFT 权重保存至 `out/sft.safetensors`。学习率通常比预训练低 5~10 倍。
 
+### 步骤 4.5（可选）：偏好对齐（DPO）
+
+```bash
+# 拉取 AllenAI Tulu 3 偏好数据（需 pip install datasets）
+python scripts/prepare_allenai.py --task dpo --sources tulu3-pref --max_docs 20000 \
+    --out data/allenai_dpo.jsonl
+python scripts/dpo.py --data data/allenai_dpo.jsonl --from_weight sft --beta 0.1
+```
+
+数据为 `{"chosen": [对话], "rejected": [对话]}`，两条对话只有最后一条 assistant 回复不同。
+日志中 `acc`（chosen 奖励高于 rejected 的比例）应逐渐上升，`margin` 逐渐增大。
+权重保存至 `out/dpo.safetensors`。
+
 ### 步骤 5：评估与对话
 
 ```bash
@@ -208,7 +262,16 @@ python scripts/eval.py --weight sft --mode chat
 
 # 深度外推：推理圈数大于训练值
 python scripts/eval.py --weight pretrain --mode chat --loops 16
+
+# 标准评测（需联网 + datasets）：选择题按对数似然打分，GSM8K 贪心生成
+python scripts/eval.py --weight pretrain --mode bench --bench arc-easy,ceval,mmlu,hellaswag --bench_limit 500
+python scripts/eval.py --weight sft --mode bench --bench gsm8k --chat 1 --bench_out results.json
+# 本地题库：每行 {"question": ..., "choices": [...], "answer": 0 或 "A"}
+python scripts/eval.py --weight sft --mode bench --bench jsonl:data/my_bench.jsonl
 ```
+
+评测结果同时给出 `acc`、`acc_norm`（按选项长度归一化）与随机基线 `random_baseline`。
+小模型在 MMLU / C-Eval 上接近随机基线是正常的。
 
 ---
 
@@ -272,22 +335,27 @@ python scripts/prepare_allenai.py --list          # 查看内置数据源
 python scripts/prepare_allenai.py --task pretrain --sources c4-zh:0.7,c4-en:0.3 \
     --max_chars 1_500_000_000 --val_docs 2000 --out data/allenai_pretrain.jsonl
 
-# 后训练：Tulu 3 SFT mixture 抽 5 万条
+# 后训练：Tulu 3 SFT mixture 抽 5 万条；偏好对齐：Tulu 3 偏好数据 2 万对
 python scripts/prepare_allenai.py --task sft --sources tulu3 --max_docs 50000 \
     --out data/allenai_sft.jsonl
+python scripts/prepare_allenai.py --task dpo --sources tulu3-pref --max_docs 20000 \
+    --out data/allenai_dpo.jsonl
 
-# 训练时还可再截断：
-python scripts/pretrain.py --data data/allenai_pretrain.jsonl --max_tokens 1_000_000_000 --max_steps 20000
+# 预分词成 memmap，训练时还可再截断：
+python scripts/tokenize_corpus.py --data data/allenai_pretrain.jsonl --out data/pretrain.bin
+python scripts/pretrain.py --data data/pretrain.bin --max_tokens 1_000_000_000 --max_steps 20000
 python scripts/sft.py --data data/allenai_sft.jsonl --max_samples 30000
+python scripts/dpo.py --data data/allenai_dpo.jsonl --max_samples 10000
 ```
 
 | 环节 | 数据量控制参数 |
 |---|---|
 | 下载 `prepare_allenai.py` | `--max_docs` / `--max_tokens` / `--max_chars`（按 `--sources` 权重分配）、`--max_scan`、`--val_docs`、`--skip` |
 | 分词器 `train_tokenizer.py` | `--max_docs` |
+| 预分词 `tokenize_corpus.py` | `--max_docs` / `--max_tokens` |
 | 预训练 `pretrain.py` | `--max_docs` / `--max_tokens` / `--max_steps` |
-| SFT `sft.py` | `--max_samples` / `--max_steps` |
-| 评估 `eval.py` | `--max_docs` |
+| SFT `sft.py`、DPO `dpo.py` | `--max_samples` / `--max_steps` |
+| 评估 `eval.py` | `--max_docs`（ppl）/ `--bench_limit`（bench） |
 
 下载哪些数据集、推荐配比、数据量估算、过滤参数、许可等完整说明见
 **[docs/allenai_data.md](docs/allenai_data.md)**。
@@ -296,32 +364,48 @@ python scripts/sft.py --data data/allenai_sft.jsonl --max_samples 30000
 
 ## 训练参数详解
 
-### pretrain.py / sft.py 通用参数
+### 数据参数
+
+| 参数 | 脚本 | 默认 | 说明 |
+|---|---|---|---|
+| `--data` | 全部 | — | 语料 glob，逗号分隔多个。pretrain：`.bin`（推荐）或 `.txt`/`.jsonl`；sft/dpo：jsonl |
+| `--max_tokens` | pretrain | 不限 | 最多使用多少 token |
+| `--max_docs` | pretrain | 不限 | [文本语料] 最多读入多少篇 |
+| `--max_samples` | sft / dpo | 不限 | 最多使用多少条对话 / 偏好对 |
+| `--max_seq_len` | 全部 | 512 | 序列长度（超长对话截断） |
+| `--tokenizer` | 全部 | `tokenizer` | 分词器目录 |
+| `--from_weight` | 全部 | none / pretrain / sft | 初始化权重名（在 `save_dir` 下） |
+| `--beta` | dpo | 0.1 | DPO 温度 |
+
+### 训练参数（pretrain / sft / dpo 共用，见 `baize/trainer.py`）
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--data` | `data/corpus*.txt` | 语料 glob（pretrain：.txt 每行一篇或 .jsonl 的 text 字段；sft：jsonl），逗号分隔多个 |
+| `--save_dir` | `out` | 权重 / 断点输出目录 |
+| `--epochs` | 2 / 3 / 1 | 训练轮数 |
 | `--max_steps` | 不限 | 最多训练多少个优化步（与 epochs 取较小者） |
-| `--max_docs` / `--max_tokens` | 不限 | [pretrain] 读入语料的文档数 / token 数上限 |
-| `--max_samples` | 不限 | [sft] 使用的有效对话条数上限 |
-| `--tokenizer` | `tokenizer` | 分词器目录 |
-| `--save_dir` | `out` | 权重输出目录 |
-| `--epochs` | 2 / 3 | 训练轮数 |
-| `--batch_size` | 8 | 每卡 batch size |
-| `--learning_rate` | 5e-4 / 1e-4 | 峰值学习率（半余弦退火） |
-| `--dtype` | `bfloat16` | 训练精度（bfloat16 / float16 / float32） |
-| `--accumulation_steps` | 1 | 梯度累积步数，有效 batch = batch_size × accumulation_steps |
+| `--batch_size` | 8 | 每卡 micro-batch |
+| `--accumulation_steps` | 1 | 梯度累积；每步样本数 = batch_size × accumulation_steps × 卡数 |
+| `--learning_rate` | 5e-4 / 1e-4 / 1e-6 | 峰值学习率 |
+| `--warmup_steps` | 总步数 1% | 线性 warmup 步数，之后余弦退火到 0.1 × 峰值 |
+| `--weight_decay` | 0.1 | 只作用于 ≥2 维权重矩阵 |
+| `--dtype` | `bfloat16` | bfloat16 / float16 / float32（FSDP 不支持 float16） |
 | `--grad_clip` | 1.0 | 梯度裁剪范数 |
-| `--log_interval` | 20 | 日志打印间隔（步数） |
-| `--save_interval` | 200 | 断点保存间隔（步数） |
-| `--from_resume` | 0 | 是否从断点续训（1=开启） |
-| `--use_compile` | 0 | 是否使用 `torch.compile`（需 PyTorch 2.0+） |
+| `--log_interval` / `--save_interval` | 20 / 200 | 日志 / 断点间隔（步数） |
+| `--from_resume` | 0 | 从 `ckpt_<save_weight>.pt` 续训（数据位置、优化器、步数全部恢复） |
+| `--fsdp` | 0 | torchrun 多卡时用 FSDP2 切分参数 / 梯度 / 优化器状态 |
+| `--grad_checkpoint` | 0 | 激活重计算：循环块每圈、Prelude/Coda 每层只存输入，反向重算 |
+| `--act_start_step` | 总步数 10% | 前 N 步关闭 ACT 跑满所有圈，之后启用早停；0 = 一开始就启用 |
+| `--use_compile` | 0 | `torch.compile` |
+| `--seed` | 42 | 随机种子（也决定数据打乱顺序） |
 
 ### 模型架构参数（仅 pretrain.py）
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--hidden_size` | 512 | 隐层维度（~40M 参数配置） |
+| `--hidden_size` | 512 | 隐层维度 |
+| `--num_attention_heads` / `--num_key_value_heads` / `--head_dim` | 8 / 2 / 64 | 注意力头数 / KV 头数（GQA）/ 每头维度 |
+| `--intermediate_size` | 1024 | 稠密 FFN 中间维度 |
 | `--prelude_layers` | 2 | Prelude 层数 P |
 | `--coda_layers` | 2 | Coda 层数 C |
 | `--max_loop_iters` | 8 | 最大（推理默认）循环圈数 T |
@@ -329,8 +413,12 @@ python scripts/sft.py --data data/allenai_sft.jsonl --max_samples 30000
 | `--max_seq_len` | 512 | 训练序列长度 |
 | `--attn_type` | `gqa` | 注意力类型（gqa / mla） |
 | `--use_moe` | 0 | Prelude/Coda 是否使用 MoE（循环块内恒为 MoE） |
-| `--n_experts` | 8 | MoE 专家数 |
+| `--n_experts` / `--n_experts_per_tok` | 8 / 2 | MoE 专家数 / 每 token 激活专家数 |
+| `--moe_intermediate_size` | 512 | 每个专家的中间维度 |
+| `--moe_capacity_factor` | 0 | >0 时按容量丢弃溢出 token；0 = 不丢 |
 | `--use_act` | 1 | 是否开启 ACT 自适应早停 |
+| `--act_init_bias` | −3 | 停机预测器初始偏置（−3 → 初始停机概率≈0.05，先跑满所有圈） |
+| `--act_ponder_coef` | 1e-3 | ponder cost 系数，越大越倾向早停；0 = 关闭 |
 
 ### demo.py 参数
 
@@ -361,15 +449,23 @@ python scripts/sft.py --data data/allenai_sft.jsonl --max_samples 30000
 Parcae scaling law 认为固定 FLOPs 时，增加循环圈数的收益高于增加 token 数。
 推荐先用少圈数预热（`--n_loops_train 4`），再逐步加圈，而非一开始就跑满 8 圈。
 
+ACT 早停：`--act_start_step`（默认总步数的 10%）之前关闭 ACT、跑满所有圈，让循环块先把后几圈训练出来，
+之后再让 ACT 学习何时停。**不要一开始就启用 ACT**：未训练的后几圈只会引入噪声，停机头会在几十步内学会
+1~2 圈就停，后几圈因权重≈0 拿不到梯度，循环深度坍缩（实测从 8 圈跌到 1.7 圈）。
+循环圈数越多激活显存越大，显存紧张时加 `--grad_checkpoint 1`。
+
 ### 监控指标
 
 训练日志形如：
 ```
-step:200/2000 loss:3.4521 aux:0.0023 lr:4.50e-04 ρ(A):0.921 eta:12.3min
+step:200/2000 loss:3.4521 aux:0.0083 lr:4.50e-04 gnorm:0.92 loops:7.40 ρ(A):0.921 eta:12.3min
 ```
 
 - **loss**：交叉熵损失，预期随训练下降
-- **aux**：MoE aux-loss（负载均衡损失），正常应在 1e-3 量级，不宜过大
+- **aux**：MoE 负载均衡损失 + ACT ponder cost（`act_ponder_coef × 平均圈数`），正常在 1e-3 ~ 1e-2 量级
+- **loops**：本步各位置实际跑的平均圈数。训练初期应接近 `max_loop_iters`，之后随 ACT 学会早停缓慢下降；
+  若很快跌到 2~3 圈，说明 ponder cost 太大（调小 `--act_ponder_coef`）
+- **gnorm**：裁剪前的梯度范数，持续飙升通常意味着学习率过大
 - **ρ(A)**：LTI 矩阵最大元素，必须 < 1；接近 0.99 时正常，接近 1.0 时关注数值稳定性
 
 ### MoE 配置建议
@@ -402,14 +498,18 @@ BaiZe/
 │   ├── config.py              # BaiZeConfig（HF PretrainedConfig）
 │   ├── model.py               # RDT 模型：GQA/MLA、MoE、LTI、ACT、LoRA、圈数嵌入
 │   ├── tokenizer.py           # BPE 训练 + 封装（含对话模板，v2 精确边界定位）
-│   ├── data.py                # 语料读取（.txt / .jsonl，支持数据量截断）
-│   └── trainer_utils.py       # LR schedule / DDP / 日志 / 权重 IO
+│   ├── data.py                # 语料读取（.txt/.jsonl）、memmap .bin 数据集、可续训采样器
+│   ├── trainer.py             # 通用训练循环：warmup / 续训 / DDP / FSDP2 / 激活重计算
+│   ├── benchmarks.py          # 标准评测：ARC / MMLU / C-Eval / HellaSwag / GSM8K / 本地 jsonl
+│   └── trainer_utils.py       # LR schedule / 分布式初始化 / 日志 / 权重 IO（严格校验）
 ├── scripts/
-│   ├── prepare_allenai.py     # AllenAI 预训练 / SFT 数据流式下载、混合、过滤、配额控制
+│   ├── prepare_allenai.py     # AllenAI 预训练 / SFT / 偏好数据流式下载、混合、过滤、配额控制
 │   ├── train_tokenizer.py     # BPE 分词器训练
-│   ├── pretrain.py            # 预训练（AMP / DDP / 断点续训 / MoE / ACT）
+│   ├── tokenize_corpus.py     # 预分词 → memmap .bin（大语料训练用）
+│   ├── pretrain.py            # 预训练
 │   ├── sft.py                 # 指令微调（prompt mask / 多轮对话）
-│   ├── eval.py                # 困惑度 / 对话评估（支持 --loops 深度外推）
+│   ├── dpo.py                 # 偏好对齐（DPO）
+│   ├── eval.py                # 困惑度 / 对话 / 标准评测（支持 --loops 深度外推）
 │   └── demo.py                # 推理 demo：命令行 + 圈数对比 + 吞吐测试 + Gradio
 ├── demo_weights/              # 预置 toy 权重（17M 参数，可直接运行 demo）
 │   ├── model.safetensors
@@ -422,7 +522,7 @@ BaiZe/
 │   └── sft.jsonl              # SFT 数据（示例）
 ├── docs/
 │   └── allenai_data.md        # AllenAI 数据接入说明（下载哪些数据、数据量控制）
-├── tests/                     # 回归测试（python tests/test_*.py）
+├── tests/                     # 测试（python tests/test_*.py；CI 见 .github/workflows/tests.yml）
 └── requirements.txt
 ```
 
@@ -453,13 +553,26 @@ pretrain/sft 脚本中 `model.train()` 已正确设置，若二次封装时忘�
 
 **Q：多卡训练报 `DDP unused parameters`？**
 
-A：ACT 早停时部分圈数不执行，对应 `LoRAAdapter.scale` 的 embedding 未参与计算。
-在 `DistributedDataParallel(model, find_unused_parameters=True)` 中开启 `find_unused_parameters` 可解决，代价是额外通信开销（小模型可接受）。
+A：v3 中 MoE 改为批量计算，所有专家参数每步都参与计算；只有在 ACT 未启用
+（`--use_act 0` 或 `--act_start_step > 0` 的前期）时停机预测器不参与计算，
+训练循环会自动为这两种情况打开 `find_unused_parameters`。
+
+**Q：加载权重报"形状不匹配 / 缺失参数"？**
+
+A：v3 的 `load_weights` 默认严格校验。最常见原因是 SFT/评估时用了与预训练不同的分词器（vocab_size 不同）
+或 `config.json` 与权重不对应。确认 `--tokenizer` 与 `--save_dir/config.json` 与预训练一致；
+确需部分加载时可在代码中调用 `load_weights(model, path, strict=False)`。
+
+**Q：显存不够？**
+
+A：依次尝试：`--grad_checkpoint 1`（激活重计算，循环圈数多时收益最大）→ 减小 `--batch_size` 并增大
+`--accumulation_steps` → 多卡 `--fsdp 1`（参数 / 梯度 / 优化器状态按卡数切分）。
 
 **Q：如何在已有模型基础上继续预训练？**
 
-A：用 `--from_weight <name>` 加载已有 safetensors 权重，`--from_resume 0`（不加载优化器状态，相当于 "fine-tune from checkpoint"）；
-若想完全恢复训练状态（含 lr schedule），改为 `--from_resume 1`。
+A：用 `--from_weight <name>` 加载已有 safetensors 权重（新的优化器与学习率调度）；
+若是训练中断，用 `--from_resume 1`：模型、优化器、步数与数据位置全部恢复，从中断处的下一个 batch 继续。
+注意续训时 `--batch_size`、`--accumulation_steps`、卡数、`--seed` 需与原来一致，否则数据位置无法对齐。
 
 ---
 
@@ -468,3 +581,6 @@ A：用 `--from_weight <name>` 加载已有 safetensors 权重，`--from_resume 
 - [Parcae](https://arxiv.org/abs/2501.04697) —— 循环深度 Transformer scaling law
 - [DeepSeek-V2](https://arxiv.org/abs/2405.04434) —— MLA 注意力压缩方案
 - [DeepSeekMoE](https://arxiv.org/abs/2401.06066) —— 细粒度 MoE 与 aux-loss 均衡
+- [Adaptive Computation Time](https://arxiv.org/abs/1603.08983) —— ACT 早停与 ponder cost
+- [DPO](https://arxiv.org/abs/2305.18290) —— 直接偏好优化
+- [Tulu 3](https://arxiv.org/abs/2411.15124) —— AllenAI 开放后训练数据与配方
