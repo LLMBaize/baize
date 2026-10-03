@@ -49,10 +49,13 @@ class BaiZeConfig(PretrainedConfig):
         n_experts_per_tok: int = 2,
         moe_intermediate_size: int = 512,
         router_aux_loss_coef: float = 1e-3,
+        moe_capacity_factor: float = 0.0,  # >0 时按容量丢弃溢出 token（形状固定、无同步）；0=不丢
         # ---- 循环块机制 ----
         lora_rank: int = 8,             # 深度 LoRA 秩
         act_threshold: float = 0.99,    # ACT 停机阈值
-        use_act: bool = True,           # False 时退化为"跑满 T 圈取加权平均"
+        use_act: bool = True,           # False 时跑满 T 圈并取最后一圈
+        act_init_bias: float = -3.0,    # 停机预测器初始偏置：-3 → 初始 p≈0.05，训练初期跑满所有圈
+        act_ponder_coef: float = 1e-3,  # ponder cost 系数（Graves ACT），鼓励简单 token 早停；0=关闭
         loop_emb_frac: float = 0.125,   # 接受圈数嵌入的通道比例（D/8）
         # ---- 常规 ----
         intermediate_size: int = 1024,  # 稠密 SwiGLU 中间维
@@ -94,10 +97,13 @@ class BaiZeConfig(PretrainedConfig):
         self.n_experts_per_tok = n_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
         self.router_aux_loss_coef = router_aux_loss_coef
+        self.moe_capacity_factor = moe_capacity_factor
 
         self.lora_rank = lora_rank
         self.act_threshold = act_threshold
         self.use_act = use_act
+        self.act_init_bias = act_init_bias
+        self.act_ponder_coef = act_ponder_coef
         self.loop_emb_frac = loop_emb_frac
 
         self.intermediate_size = intermediate_size

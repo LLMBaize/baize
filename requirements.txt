@@ -1,0 +1,11 @@
+# BaiZe 依赖
+torch>=2.6            # --fsdp 需要 FSDP2（torch.distributed.fsdp.fully_shard）
+transformers>=4.40
+tokenizers>=0.19
+safetensors
+numpy
+
+# 可选：AllenAI 数据下载（prepare_allenai.py）与标准评测集（eval.py --mode bench）
+datasets>=2.19
+# 可选：scripts/demo.py --web
+# gradio>=4.0
