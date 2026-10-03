@@ -165,6 +165,28 @@ def test_hf_endpoint_applies_after_import():
         configure_hf_endpoint(old or "https://huggingface.co")
 
 
+def test_mirror_pagination_next_link_rewritten():
+    """镜像站返回的下一页 Link 指向 huggingface.co，必须改写回镜像地址。"""
+    from huggingface_hub.utils import _pagination
+    from baize.hub import configure_hf_endpoint
+
+    class FakeResponse:
+        links = {"next": {"url": "https://huggingface.co/api/datasets/allenai/c4/tree/abc/multilingual?cursor=XYZ&limit=1000"}}
+    try:
+        configure_hf_endpoint("https://hf-mirror.com")
+        assert _pagination._get_next_page(FakeResponse()) == \
+            "https://hf-mirror.com/api/datasets/allenai/c4/tree/abc/multilingual?cursor=XYZ&limit=1000"
+        configure_hf_endpoint("https://hf-mirror.com")  # 重复调用不会层层包装
+        assert _pagination._get_next_page(FakeResponse()).startswith("https://hf-mirror.com/api/")
+
+        class NoNext:
+            links = {}
+        assert _pagination._get_next_page(NoNext()) is None
+    finally:
+        configure_hf_endpoint("https://huggingface.co")
+    assert _pagination._get_next_page(FakeResponse()).startswith("https://huggingface.co/api/")
+
+
 def test_source_error_keeps_other_sources():
     def stream_fn(src, seed, shuffle_buffer, skip):
         if src["path"] == "allenai/olmo-mix-1124":

@@ -35,6 +35,9 @@ export HF_ENDPOINT=https://hf-mirror.com
    确认是镜像地址即可。也可以用 `export HF_ENDPOINT=https://hf-mirror.com`，但**必须在启动 Python 之前 export**：
    huggingface_hub / datasets 只在 import 时读取一次该变量，写成 `HF_ENDPOINT=...`（没有 export）、
    在别的终端设置、或在 Python 里 import 之后再改 `os.environ` 都不会生效。
+   另一个坑：列目录等分页接口的"下一页"地址由服务器在响应头里返回，hf-mirror 返回的仍是 huggingface.co，
+   所以只设置 `HF_ENDPOINT` 时第 1 页走镜像、第 2 页起又会去连官方站点（`allenai/c4` 的 `multilingual/`
+   有上万个文件，必然翻页）。`--hf_endpoint` 会把翻页地址一并改写回镜像。
 2. **IPv6 问题**：`Network is unreachable` 时通时断，多半是域名解析到了 IPv6 地址，但服务器没有 IPv6 路由。
    在 `/etc/gai.conf` 里加一行 `precedence ::ffff:0:0/96 100`，让系统优先走 IPv4。
    可以用 `curl -4 -I https://huggingface.co` 和 `curl -6 -I https://huggingface.co` 对比验证。
