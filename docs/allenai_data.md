@@ -31,7 +31,10 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 **网络问题**：如果报 `ConnectionError`、`timed out`，或者 `[Errno 101] Network is unreachable`，按顺序排查：
 
-1. **镜像**：`export HF_ENDPOINT=https://hf-mirror.com`（国内首选）。
+1. **镜像**（国内首选）：加参数 `--hf_endpoint https://hf-mirror.com`。脚本启动时会打印 `[hf] endpoint = ...`，
+   确认是镜像地址即可。也可以用 `export HF_ENDPOINT=https://hf-mirror.com`，但**必须在启动 Python 之前 export**：
+   huggingface_hub / datasets 只在 import 时读取一次该变量，写成 `HF_ENDPOINT=...`（没有 export）、
+   在别的终端设置、或在 Python 里 import 之后再改 `os.environ` 都不会生效。
 2. **IPv6 问题**：`Network is unreachable` 时通时断，多半是域名解析到了 IPv6 地址，但服务器没有 IPv6 路由。
    在 `/etc/gai.conf` 里加一行 `precedence ::ffff:0:0/96 100`，让系统优先走 IPv4。
    可以用 `curl -4 -I https://huggingface.co` 和 `curl -6 -I https://huggingface.co` 对比验证。

@@ -147,6 +147,24 @@ def test_dpo_pairs_normalized_and_filtered():
         assert rows[1]["chosen"][0] == {"role": "user", "content": "字符串问题"}
 
 
+def test_hf_endpoint_applies_after_import():
+    import datasets.config as dc
+    import huggingface_hub.constants as hc
+    from baize.hub import configure_hf_endpoint
+    old = os.environ.get("HF_ENDPOINT")
+    try:
+        assert configure_hf_endpoint("https://hf-mirror.com/") == "https://hf-mirror.com"
+        assert hc.ENDPOINT == "https://hf-mirror.com" and dc.HF_ENDPOINT == "https://hf-mirror.com"
+        assert dc.HUB_DATASETS_URL.startswith("https://hf-mirror.com/datasets/")
+        assert hc.HUGGINGFACE_CO_URL_TEMPLATE.startswith("https://hf-mirror.com/")
+    finally:
+        if old is None:
+            os.environ.pop("HF_ENDPOINT", None)
+        else:
+            os.environ["HF_ENDPOINT"] = old
+        configure_hf_endpoint(old or "https://huggingface.co")
+
+
 def test_source_error_keeps_other_sources():
     def stream_fn(src, seed, shuffle_buffer, skip):
         if src["path"] == "allenai/olmo-mix-1124":

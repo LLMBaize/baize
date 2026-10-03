@@ -86,6 +86,7 @@ def main():
     parser.add_argument("--bench_limit", type=int, default=None, help="[bench] 每个评测集最多评多少题")
     parser.add_argument("--chat", type=int, default=0, choices=[0, 1], help="[bench] 用对话模板包裹题目（SFT 模型）")
     parser.add_argument("--bench_out", type=str, default=None, help="[bench] 结果写入 json 文件")
+    parser.add_argument("--hf_endpoint", type=str, default=None, help="[bench] HuggingFace 访问地址，如 https://hf-mirror.com")
     parser.add_argument("--loops", type=int, default=None, help="推理循环圈数（可大于训练值做深度外推）")
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -105,6 +106,8 @@ def main():
     print(f"推理循环圈数: {args.loops or config.max_loop_iters}")
 
     if args.mode == "bench":
+        from baize.hub import configure_hf_endpoint
+        print(f"[hf] endpoint = {configure_hf_endpoint(args.hf_endpoint)}", flush=True)
         results = {}
         for spec in [b.strip() for b in args.bench.split(",") if b.strip()]:
             kind, items = load_benchmark(spec, limit=args.bench_limit)
