@@ -29,6 +29,26 @@ pip install datasets            # 新增依赖（其余依赖同 README）
 export HF_ENDPOINT=https://hf-mirror.com
 ```
 
+**网络问题**：如果报 `ConnectionError`、`timed out`，或者 `[Errno 101] Network is unreachable`，按顺序排查：
+
+1. **镜像**：`export HF_ENDPOINT=https://hf-mirror.com`（国内首选）。
+2. **IPv6 问题**：`Network is unreachable` 时通时断，多半是域名解析到了 IPv6 地址，但服务器没有 IPv6 路由。
+   在 `/etc/gai.conf` 里加一行 `precedence ::ffff:0:0/96 100`，让系统优先走 IPv4。
+   可以用 `curl -4 -I https://huggingface.co` 和 `curl -6 -I https://huggingface.co` 对比验证。
+3. **代理**：`export HTTPS_PROXY=http://<代理地址>:<端口>`。
+4. **离线**：先把文件下载到本地，再读本地文件（`json@<本地glob>` 会让脚本用 `json` 读取器读本地文件）：
+
+   ```bash
+   # 只下载 mC4 中文的前 20 个训练分片（约每片几百 MB，可按需增减）
+   huggingface-cli download allenai/c4 --repo-type dataset \
+       --include "multilingual/c4-zh.tfrecord-000[01]*.json.gz" --local-dir data/hf/c4
+   python scripts/prepare_allenai.py --task pretrain \
+       --sources "json@data/hf/c4/multilingual/c4-zh.*.json.gz" --max_chars 1_000_000_000 \
+       --out data/allenai_pretrain.jsonl
+   ```
+   SFT、DPO 数据集同理：用 `huggingface-cli download allenai/tulu-3-sft-mixture --repo-type dataset --local-dir ...`
+   下载后，用 `--sources "parquet@<本地目录>/data/*.parquet"` 读取。
+
 **登录**：表中的数据集都是公开数据集，一般不需要登录。如果某个数据集要求先在网页上同意使用条款，
 先在对应页面点同意，再运行 `huggingface-cli login`（或设置 `HF_TOKEN` 环境变量）。
 

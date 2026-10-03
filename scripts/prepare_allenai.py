@@ -157,6 +157,21 @@ def parse_sources(spec: str, presets: dict):
     return sources
 
 
+NETWORK_HINT = """        无法连接 HuggingFace。可按顺序尝试（详见 docs/allenai_data.md「网络问题」）：
+          1) 使用镜像：export HF_ENDPOINT=https://hf-mirror.com
+          2) 报 'Network is unreachable'（errno 101）多为服务器无 IPv6 路由却解析到了 IPv6 地址：
+             在 /etc/gai.conf 加一行 'precedence ::ffff:0:0/96 100' 让系统优先走 IPv4
+          3) 走代理：export HTTPS_PROXY=http://<代理地址>:<端口>
+          4) 离线：先用 huggingface-cli download 把文件下到本地，再用 --sources "json@<本地glob>" 读取"""
+
+
+def is_network_error(exc) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    keys = ("network is unreachable", "connection", "timed out", "timeout", "name resolution",
+            "temporary failure", "max retries", "errno 101", "errno 110", "errno 111", "ssl")
+    return any(k in text for k in keys)
+
+
 def open_stream(src, seed, shuffle_buffer, skip):
     """以 streaming 方式打开一个 HF 数据集，返回样本迭代器。"""
     from datasets import load_dataset
@@ -357,9 +372,12 @@ def prepare(args, stream_fn=open_stream):
                 continue
             except Exception as exc:  # 网络错误 / config 名错误等：停掉该源，保留已写数据
                 st["exhausted"], st["error"] = True, f"{type(exc).__name__}: {exc}"
-                print(f"[error] {src['key']}: {st['error']}\n"
-                      f"        请到 https://huggingface.co/datasets/{src['path']} 确认 config/文件名，"
-                      f"或改用 '仓库#config' / '仓库@文件glob' 自定义写法", flush=True)
+                print(f"[error] {src['key']}: {st['error']}", flush=True)
+                if is_network_error(exc):
+                    print(NETWORK_HINT, flush=True)
+                else:
+                    print(f"        请到 https://huggingface.co/datasets/{src['path']} 确认 config/文件名，"
+                          f"或改用 '仓库#config' / '仓库@文件glob' 自定义写法", flush=True)
                 continue
 
             st["scanned"] += 1
