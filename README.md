@@ -224,6 +224,11 @@ python scripts/pretrain.py --data data/pretrain.bin --from_resume 1
 
 训练权重保存至 `out/pretrain.safetensors`，断点文件为 `out/ckpt_pretrain.pt`。
 
+- `ckpt_pretrain.pt`：断点（fp32 权重 + 优化器状态 + 步数），每 `--save_interval` 步**覆盖**一次，只用于续训；
+- `pretrain.safetensors` + `config.json`：训练结束时生成的 fp16 权重，用于推理 / SFT / 评测；
+- 想保留各阶段的权重：训练时加 `--snapshot_interval 1000`，或对正在跑的训练另开一个进程
+  `python scripts/export_ckpt.py --ckpt out/ckpt_pretrain.pt --watch`，断点每更新一次就导出到 `out/snapshots/step_XXXXXX/`。
+
 训练日志会持续打印 `ρ(A)` 值，正常应始终 < 1（由 LTI 参数化构造保证，但值得监视数值溢出）。
 
 ### 步骤 4：指令微调（SFT）
@@ -396,6 +401,7 @@ python scripts/dpo.py --data data/allenai_dpo.jsonl --max_samples 10000
 | `--dtype` | `bfloat16` | bfloat16 / float16 / float32（FSDP 不支持 float16） |
 | `--grad_clip` | 1.0 | 梯度裁剪范数 |
 | `--log_interval` / `--save_interval` | 20 / 200 | 日志 / 断点间隔（步数） |
+| `--snapshot_interval` | 0 | 每 N 步额外保存一份 fp16 权重快照到 `<save_dir>/snapshots/step_XXXXXX/`（不覆盖，可直接推理 / 评测） |
 | `--from_resume` | 0 | 从 `ckpt_<save_weight>.pt` 续训（数据位置、优化器、步数全部恢复） |
 | `--fsdp` | 0 | torchrun 多卡时用 FSDP2 切分参数 / 梯度 / 优化器状态 |
 | `--grad_checkpoint` | 0 | 激活重计算：循环块每圈、Prelude/Coda 每层只存输入，反向重算 |
