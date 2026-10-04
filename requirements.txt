@@ -7,5 +7,7 @@ numpy
 
 # 可选：AllenAI 数据下载（prepare_allenai.py）与标准评测集（eval.py --mode bench）
 datasets>=2.19
+# 可选：训练指标记录到 Weights & Biases（--use_wandb 1）
+# wandb
 # 可选：scripts/demo.py --web
 # gradio>=4.0

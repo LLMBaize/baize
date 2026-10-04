@@ -437,10 +437,31 @@ python scripts/dpo.py --data data/allenai_dpo.jsonl --max_samples 10000
 | 显存不够 | 先开 `--grad_checkpoint 1`，再减小 `--batch_size` 并同比增大 `--accumulation_steps`（每步 token 数不变） |
 | 中途断了 | 原命令加 `--from_resume 1`；`--data`、`--batch_size`、`--accumulation_steps`、`--seed` 和模型参数不能改 |
 | 保留中间权重 | `--snapshot_interval 2000`，或另开进程运行 `scripts/export_ckpt.py --watch` |
+| 在网页上看曲线 | `--use_wandb 1`（见下方「用 wandb 记录训练」） |
 | ACT 早停过猛（loops 很快跌到 2 以下） | 调小 `--act_ponder_coef`（如 1e-4），或增大 `--act_start_step` |
 | 想用满循环深度 | `--use_act 0`，固定跑 `n_loops_train` 圈 |
 | 推理更快 | `--loops 2`（ACT 模型大多 2–3 圈就停，实测效果不变） |
 | 减少复读 | 生成时加 `--temperature 0.7 --repetition_penalty 1.2`；不要用贪心解码长回答 |
+
+### 用 wandb 记录训练
+
+```bash
+pip install wandb && wandb login          # 一次性；服务器无外网时跳过 login，用 --wandb_mode offline
+
+python scripts/pretrain.py ... --use_wandb 1 --wandb_project baize --wandb_run_name pretrain-0.13b
+python scripts/sft.py      ... --use_wandb 1 --wandb_project baize --wandb_run_name sft-0.13b
+
+# 离线模式：先在本地记录，有网时再上传
+python scripts/pretrain.py ... --use_wandb 1 --wandb_mode offline
+wandb sync out/wandb/offline-run-*
+```
+
+- 只在主进程（rank 0）记录，多卡不会重复；每 `--log_interval` 步写一次。
+- 记录内容：`train/loss`、`train/aux`（DPO 还有 `train/acc`、`train/margin`）、`train/lr`、`train/grad_norm`、
+  `train/rho_A`、`train/samples`、`train/steps_per_sec`、`act/avg_loops`、`act/enabled`；
+  config 里保存全部训练参数和模型结构。
+- 断点里会保存 wandb run id，`--from_resume 1` 续训时**接着写同一个 run**，曲线不会断开。
+- 没装 wandb 或登录失败时只打印警告，训练照常进行。
 
 ### 训练日志怎么看
 
@@ -492,6 +513,10 @@ python scripts/dpo.py --data data/allenai_dpo.jsonl --max_samples 10000
 | `--act_start_step` | 预训练：总步数 10%；SFT/DPO（加载预训练权重时）：0 | 前 N 步关闭 ACT 跑满所有圈，之后启用早停；0 = 一开始就启用 |
 | `--use_compile` | 0 | `torch.compile` |
 | `--seed` | 42 | 随机种子（也决定数据打乱顺序） |
+| `--use_wandb` | 0 | 把训练指标记录到 Weights & Biases（需 `pip install wandb` 并 `wandb login`） |
+| `--wandb_project` / `--wandb_entity` | `baize` / 登录账号 | wandb 项目名 / 团队名 |
+| `--wandb_run_name` | `<阶段>-<时间>` | run 名称，如 `pretrain-1004-0628` |
+| `--wandb_mode` | `online` | `offline` 只写本地 `<save_dir>/wandb/`，之后 `wandb sync` 上传（服务器没外网时用） |
 
 ### 模型架构参数（仅 pretrain.py）
 
