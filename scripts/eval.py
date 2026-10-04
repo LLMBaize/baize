@@ -30,21 +30,35 @@ from baize.trainer_utils import load_weights
 
 
 @torch.inference_mode()
-def eval_ppl(model, tokenizer, files, device, seq_len=512, stride=256, max_docs=None):
-    """滑动窗口困惑度（stride < seq_len，窗口重叠以覆盖长程依赖）。"""
+def eval_ppl(model, tokenizer, files, device, seq_len=512, stride=256, max_docs=None, loops=None,
+             batch_size=16):
+    """滑动窗口困惑度。
+
+    窗口长 seq_len、步长 stride（重叠部分只作上下文）：每个窗口只对最后 stride 个新 token 计分
+    （第一个窗口全部计分），每个 token 恰好计一次，且都至少有 seq_len - stride 的上文。
+    """
     ids = []
     for text in iter_documents(files, max_docs=max_docs):
         ids.extend(tokenizer.encode(text))
         ids.append(tokenizer.eos_token_id)
+    ids = torch.tensor(ids, dtype=torch.long)
+    starts = list(range(0, len(ids) - seq_len, stride))
+    print(f"验证集 {len(ids):,} token，{len(starts):,} 个窗口（seq_len={seq_len}, stride={stride}）", flush=True)
+    use_amp = str(device).startswith("cuda")
     nll, count = 0.0, 0
-    for i in range(0, len(ids) - seq_len, stride):
-        chunk = torch.tensor(ids[i : i + seq_len + 1], dtype=torch.long, device=device).unsqueeze(0)
-        logits = model(chunk[:, :-1]).logits
+    for b in range(0, len(starts), batch_size):
+        batch = torch.stack([ids[i: i + seq_len + 1] for i in starts[b: b + batch_size]]).to(device)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+            logits = model(batch[:, :-1], n_loops=loops).logits
         loss = torch.nn.functional.cross_entropy(
-            logits[0].float(), chunk[0, 1:], reduction="sum"
-        )
-        nll += loss.item()
-        count += seq_len
+            logits.float().transpose(1, 2), batch[:, 1:], reduction="none")  # [B, seq_len]
+        for j, i in enumerate(starts[b: b + batch_size]):
+            keep = seq_len if i == 0 else stride
+            nll += loss[j, -keep:].sum().item()
+            count += keep
+        done = min(b + batch_size, len(starts))
+        if done % (batch_size * 50) < batch_size or done == len(starts):
+            print(f"  [{done:,}/{len(starts):,}] 当前 PPL={math.exp(nll / count):.2f}", flush=True)
     ppl = math.exp(nll / count)
     print(f"tokens={count:,}  mean NLL={nll / count:.4f}  PPL={ppl:.2f}")
     return ppl
@@ -162,7 +176,7 @@ def main():
     elif args.mode == "ppl":
         files = sorted(f for pat in args.data.split(",") for f in glob.glob(pat.strip()))
         assert files, f"未找到评估语料: {args.data}"
-        eval_ppl(model, tokenizer, files, args.device, max_docs=args.max_docs)
+        eval_ppl(model, tokenizer, files, args.device, max_docs=args.max_docs, loops=args.loops)
     elif args.mode == "generate":
         prompts = [x.strip() for x in args.prompt.split("||") if x.strip()] if args.prompt else None
         generate_text(model, tokenizer, args.device, prompts, loops=args.loops,
