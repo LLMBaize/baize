@@ -27,6 +27,8 @@ $$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + 
 - [快速开始（5 步）](#快速开始5-步)
 - [推理 demo](#推理-demo)
 - [使用 AllenAI 数据](#使用-allenai-数据)
+- [实测报告：0.13B](#实测报告013b)
+- [参数使用指南](#参数使用指南)
 - [训练参数详解](#训练参数详解)
 - [RDT 训练建议](#rdt-训练建议)
 - [目录结构](#目录结构)
@@ -243,6 +245,9 @@ python scripts/sft.py \
 
 SFT 权重保存至 `out/sft.safetensors`。学习率通常比预训练低 5~10 倍。
 
+从预训练权重继续训练时，SFT / DPO 默认沿用预训练的训练圈数（`config.json` 里的 `n_loops_train`），
+并且从第 0 步就启用 ACT（停机头已在预训练中学好）。需要时可以用 `--n_loops_train` / `--act_start_step` 覆盖。
+
 ### 步骤 4.5（可选）：偏好对齐（DPO）
 
 ```bash
@@ -259,8 +264,11 @@ python scripts/dpo.py --data data/allenai_dpo.jsonl --from_weight sft --beta 0.1
 ### 步骤 5：评估与对话
 
 ```bash
-# 计算困惑度（PPL）
-python scripts/eval.py --weight pretrain --mode ppl --data "data/corpus*.txt"
+# 计算困惑度（PPL），--loops 指定推理圈数
+python scripts/eval.py --weight pretrain --mode ppl --data data/allenai_pretrain.val.jsonl --loops 4
+
+# 预训练权重：纯续写（预训练模型没见过对话模板，不要用 chat 模式测）
+python scripts/eval.py --weight pretrain --mode generate --loops 4 --prompt "中国的首都是||人工智能是一种"
 
 # 对话模式（SFT 权重）
 python scripts/eval.py --weight sft --mode chat
@@ -276,7 +284,8 @@ python scripts/eval.py --weight sft --mode bench --bench jsonl:data/my_bench.jso
 ```
 
 评测结果同时给出 `acc`、`acc_norm`（按选项长度归一化）与随机基线 `random_baseline`。
-小模型在 MMLU / C-Eval 上接近随机基线是正常的。
+小模型在 MMLU / C-Eval 上接近随机基线是正常的；0.1B 量级主要看 ARC-Easy 和 HellaSwag。
+实测数据见 [实测报告：0.13B](#实测报告013b)。
 
 ---
 
@@ -371,6 +380,101 @@ python scripts/dpo.py --data data/allenai_dpo.jsonl --max_samples 10000
 
 ---
 
+## 实测报告：0.13B
+
+单张 A100 80GB 跑完整条链路（AllenAI 数据 → 分词器 → 预训练 2B token → SFT → 评测）。
+完整的配置、训练曲线、评测和分析见 **[docs/training_report_0.1b.md](docs/training_report_0.1b.md)**。
+
+| 项目 | 值 |
+|---|---|
+| 模型 | 128.70M 参数（激活 115.72M）：hidden 1024，Prelude 4 + 循环块（MoE）+ Coda 4，训练 4 圈 |
+| 数据 | 预训练：mC4 中文 70% + C4 英文 30%，2.0B token；SFT：Tulu 3 + WildChat 中文，8.5 万条 |
+| 耗时 | 预训练约 8 小时（7,629 步），SFT 约 65 分钟 |
+| 预训练末期 loss / 验证集 PPL | 约 2.76 / 16.5 |
+| ACT 平均圈数 | 训练末期约 2.6（从第 762 步启用后缓慢下降，没有塌缩） |
+
+标准评测（SFT 权重，每项 500 题，误差约 ±2%）：
+
+| 圈数 | ARC-Easy | HellaSwag | C-Eval | MMLU |
+|---|---|---|---|---|
+| 1 | 32.0 | 33.6 | 22.0 | 22.0 |
+| 2 | 31.2 | 34.6 | 22.6 | 23.4 |
+| 4 | 31.4 | **35.2** | 22.6 | 23.4 |
+| 8 | 31.4 | 35.2 | 22.6 | 23.4 |
+| 随机 | 25.0 | 25.0 | 25.0 | 25.0 |
+
+主要结论：
+
+- 链路通、训练稳定，水平符合 0.13B / 2B token 的预期。HellaSwag 略好于 GPT-2 small（约 31%）；ARC-Easy 偏低，是因为英文数据只有约 0.6B token。
+- **循环深度基本没有被利用**：ACT 学会了 2–3 圈就停，4 圈和 8 圈结果完全一样。推理用 `--loops 2` 即可，更快且效果不变。
+  想让深度发挥作用，可以调小 `--act_ponder_coef`（如 1e-4）、推迟 `--act_start_step`，或加入数学 / 推理数据。
+- 预训练权重要用 `--mode generate` 测续写；chat 模式会套对话模板，输出乱码。
+- 提升分数最有效的方法依次是：加英文和知识类数据 → 加 token → 加参数。
+
+---
+
+## 参数使用指南
+
+### 按规模推荐的配置
+
+| 规模 | 架构参数 | 训练参数 | 数据量 | 单卡 A100 耗时 |
+|---|---|---|---|---|
+| 冒烟测试（约 10M） | 默认值 | `--batch_size 8 --max_steps 200` | 任意 | 几分钟 |
+| **0.13B（已实测）** | `--hidden_size 1024 --num_attention_heads 16 --num_key_value_heads 4 --head_dim 64 --intermediate_size 2816 --prelude_layers 4 --coda_layers 4 --moe_intermediate_size 704` | `--max_seq_len 512 --batch_size 32 --accumulation_steps 16 --learning_rate 6e-4` | 2–5B token | 2B token 约 8 小时 |
+| 约 0.4B | `--hidden_size 1536 --num_attention_heads 12 --num_key_value_heads 4 --head_dim 128 --intermediate_size 4096 --prelude_layers 6 --coda_layers 6 --moe_intermediate_size 1024` | `--max_seq_len 1024 --batch_size 16 --accumulation_steps 16 --learning_rate 4e-4 --grad_checkpoint 1` | 8–20B token | 10B token 约 5 天 |
+| 约 0.9B | `--hidden_size 2048 --num_attention_heads 16 --num_key_value_heads 4 --head_dim 128 --intermediate_size 5632 --prelude_layers 8 --coda_layers 8 --moe_intermediate_size 2048` | `--max_seq_len 1024 --batch_size 16 --accumulation_steps 8 --learning_rate 3e-4 --grad_checkpoint 1`，建议多卡 `--fsdp 1` | 20B+ token | 20B token 单卡约 3 周，8 卡约 3 天 |
+
+所有规模都建议使用 `--max_loop_iters 8 --n_loops_train 4`。实际参数量以启动日志中的 `Model Params` 为准，词表越大参数越多。
+长跑之前先加 `--max_steps 200` 冒烟，确认显存、速度和 loss 正常。
+
+### 关键参数怎么选
+
+| 想要 | 怎么设 |
+|---|---|
+| 每步 token 数 | `batch_size × accumulation_steps × 卡数 × max_seq_len`，预训练建议 25 万 ~ 100 万 |
+| 控制数据量 | 准备时用 `prepare_allenai.py --max_chars / --max_tokens`；训练时用 `--max_tokens` / `--max_steps` 截断 |
+| 学习率 | 预训练：0.1B 用 6e-4，0.4B 用 4e-4，1B 用 3e-4；SFT 用 1e-4（约为预训练的 1/5）；DPO 用 1e-6 |
+| 显存不够 | 先开 `--grad_checkpoint 1`，再减小 `--batch_size` 并同比增大 `--accumulation_steps`（每步 token 数不变） |
+| 中途断了 | 原命令加 `--from_resume 1`；`--data`、`--batch_size`、`--accumulation_steps`、`--seed` 和模型参数不能改 |
+| 保留中间权重 | `--snapshot_interval 2000`，或另开进程运行 `scripts/export_ckpt.py --watch` |
+| 在网页上看曲线 | `--use_wandb 1`（见下方「用 wandb 记录训练」） |
+| ACT 早停过猛（loops 很快跌到 2 以下） | 调小 `--act_ponder_coef`（如 1e-4），或增大 `--act_start_step` |
+| 想用满循环深度 | `--use_act 0`，固定跑 `n_loops_train` 圈 |
+| 推理更快 | `--loops 2`（ACT 模型大多 2–3 圈就停，实测效果不变） |
+| 减少复读 | 生成时加 `--temperature 0.7 --repetition_penalty 1.2`；不要用贪心解码长回答 |
+
+### 用 wandb 记录训练
+
+```bash
+pip install wandb && wandb login          # 一次性；服务器无外网时跳过 login，用 --wandb_mode offline
+
+python scripts/pretrain.py ... --use_wandb 1 --wandb_project baize --wandb_run_name pretrain-0.13b
+python scripts/sft.py      ... --use_wandb 1 --wandb_project baize --wandb_run_name sft-0.13b
+
+# 离线模式：先在本地记录，有网时再上传
+python scripts/pretrain.py ... --use_wandb 1 --wandb_mode offline
+wandb sync out/wandb/offline-run-*
+```
+
+- 只在主进程（rank 0）记录，多卡不会重复；每 `--log_interval` 步写一次。
+- 记录内容：`train/loss`、`train/aux`（DPO 还有 `train/acc`、`train/margin`）、`train/lr`、`train/grad_norm`、
+  `train/rho_A`、`train/samples`、`train/steps_per_sec`、`act/avg_loops`、`act/enabled`；
+  config 里保存全部训练参数和模型结构。
+- 断点里会保存 wandb run id，`--from_resume 1` 续训时**接着写同一个 run**，曲线不会断开。
+- 没装 wandb 或登录失败时只打印警告，训练照常进行。
+
+### 训练日志怎么看
+
+| 指标 | 健康状态 | 需要处理 |
+|---|---|---|
+| loss | 平稳下降；单步 ±0.1 的波动正常 | 连续几百步不降反升 → 降低学习率后续训 |
+| gnorm | 预训练 0.2–1，SFT 刚开始 1–2 | 持续飙升 → 学习率过大 |
+| loops | ACT 启用后缓慢下降，稳定在 2–4 | 几百步内跌到 2 以下 → 调小 `--act_ponder_coef` |
+| aux | 1e-3 ~ 1e-2 | 突然大幅变化，结合 loops 一起看 |
+| ρ(A) | 小于 1，训练中缓慢下降 | 接近 1 → 关注数值稳定性 |
+
+---
+
 ## 训练参数详解
 
 ### 数据参数
@@ -385,6 +489,7 @@ python scripts/dpo.py --data data/allenai_dpo.jsonl --max_samples 10000
 | `--tokenizer` | 全部 | `tokenizer` | 分词器目录 |
 | `--from_weight` | 全部 | none / pretrain / sft | 初始化权重名（在 `save_dir` 下） |
 | `--beta` | dpo | 0.1 | DPO 温度 |
+| `--n_loops_train` | sft / dpo | 沿用预训练 | 训练圈数；默认读取 `config.json` 里的 `n_loops_train`，没有则用 `max_loop_iters` |
 
 ### 训练参数（pretrain / sft / dpo 共用，见 `baize/trainer.py`）
 
@@ -405,9 +510,13 @@ python scripts/dpo.py --data data/allenai_dpo.jsonl --max_samples 10000
 | `--from_resume` | 0 | 从 `ckpt_<save_weight>.pt` 续训（数据位置、优化器、步数全部恢复） |
 | `--fsdp` | 0 | torchrun 多卡时用 FSDP2 切分参数 / 梯度 / 优化器状态 |
 | `--grad_checkpoint` | 0 | 激活重计算：循环块每圈、Prelude/Coda 每层只存输入，反向重算 |
-| `--act_start_step` | 总步数 10% | 前 N 步关闭 ACT 跑满所有圈，之后启用早停；0 = 一开始就启用 |
+| `--act_start_step` | 预训练：总步数 10%；SFT/DPO（加载预训练权重时）：0 | 前 N 步关闭 ACT 跑满所有圈，之后启用早停；0 = 一开始就启用 |
 | `--use_compile` | 0 | `torch.compile` |
 | `--seed` | 42 | 随机种子（也决定数据打乱顺序） |
+| `--use_wandb` | 0 | 把训练指标记录到 Weights & Biases（需 `pip install wandb` 并 `wandb login`） |
+| `--wandb_project` / `--wandb_entity` | `baize` / 登录账号 | wandb 项目名 / 团队名 |
+| `--wandb_run_name` | `<阶段>-<时间>` | run 名称，如 `pretrain-1004-0628` |
+| `--wandb_mode` | `online` | `offline` 只写本地 `<save_dir>/wandb/`，之后 `wandb sync` 上传（服务器没外网时用） |
 
 ### 模型架构参数（仅 pretrain.py）
 
@@ -419,7 +528,7 @@ python scripts/dpo.py --data data/allenai_dpo.jsonl --max_samples 10000
 | `--prelude_layers` | 2 | Prelude 层数 P |
 | `--coda_layers` | 2 | Coda 层数 C |
 | `--max_loop_iters` | 8 | 最大（推理默认）循环圈数 T |
-| `--n_loops_train` | 同 max_loop_iters | 训练时实际使用的圈数，可小于 max_loop_iters |
+| `--n_loops_train` | 同 max_loop_iters | 训练时实际使用的圈数，可小于 max_loop_iters；会写进 `config.json`，SFT/DPO 默认沿用 |
 | `--max_seq_len` | 512 | 训练序列长度 |
 | `--attn_type` | `gqa` | 注意力类型（gqa / mla） |
 | `--use_moe` | 0 | Prelude/Coda 是否使用 MoE（循环块内恒为 MoE） |
@@ -429,6 +538,24 @@ python scripts/dpo.py --data data/allenai_dpo.jsonl --max_samples 10000
 | `--use_act` | 1 | 是否开启 ACT 自适应早停 |
 | `--act_init_bias` | −3 | 停机预测器初始偏置（−3 → 初始停机概率≈0.05，先跑满所有圈） |
 | `--act_ponder_coef` | 1e-3 | ponder cost 系数，越大越倾向早停；0 = 关闭 |
+
+### eval.py 参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--mode` | `chat` | `ppl` 困惑度 / `generate` 纯续写（预训练权重）/ `chat` 对话（SFT 之后）/ `bench` 标准评测 |
+| `--weight` / `--save_dir` | `pretrain` / `out` | 权重名与所在目录（目录下需要有 `config.json`） |
+| `--loops` | 同 config | 推理圈数；ppl / generate / chat / bench 都生效 |
+| `--data` / `--max_docs` | — | [ppl] 评估语料（txt / jsonl）与最多篇数 |
+| `--prompt` | None | [generate] 续写开头，多个用 `\|\|` 分隔；不给则进入交互输入 |
+| `--temperature` / `--top_p` / `--top_k` | 0.7 / 0.85 / 50 | [generate] 采样参数，temperature ≤ 0 为贪心 |
+| `--repetition_penalty` | 1.2 | [generate] 重复惩罚，小模型建议 1.1–1.3 |
+| `--max_new_tokens` | 256 | 最大生成长度 |
+| `--bench` | `arc-easy` | [bench] 逗号分隔：`arc-easy,arc-challenge,mmlu,ceval[:学科],hellaswag,gsm8k,jsonl:<路径>` |
+| `--bench_limit` | 不限 | [bench] 每个评测集最多多少题；500 题误差约 ±2% |
+| `--chat` | 0 | [bench] 用对话模板包裹题目，SFT 模型用 1 |
+| `--bench_out` | None | [bench] 结果写入 json |
+| `--hf_endpoint` | 环境变量 | HuggingFace 地址，如 `https://hf-mirror.com` |
 
 ### demo.py 参数
 
@@ -473,8 +600,8 @@ step:200/2000 loss:3.4521 aux:0.0083 lr:4.50e-04 gnorm:0.92 loops:7.40 ρ(A):0.9
 
 - **loss**：交叉熵损失，预期随训练下降
 - **aux**：MoE 负载均衡损失 + ACT ponder cost（`act_ponder_coef × 平均圈数`），正常在 1e-3 ~ 1e-2 量级
-- **loops**：本步各位置实际跑的平均圈数。训练初期应接近 `max_loop_iters`，之后随 ACT 学会早停缓慢下降；
-  若很快跌到 2~3 圈，说明 ponder cost 太大（调小 `--act_ponder_coef`）
+- **loops**：本步各位置实际跑的平均圈数。ACT 启用前等于训练圈数，之后随 ACT 学会早停缓慢下降
+  （0.13B 实测：约 3,000 步从 4 降到 2.8，最后稳定在约 2.6）；若几百步内就跌到 2 以下，说明 ponder cost 太大（调小 `--act_ponder_coef`）
 - **gnorm**：裁剪前的梯度范数，持续飙升通常意味着学习率过大
 - **ρ(A)**：LTI 矩阵最大元素，必须 < 1；接近 0.99 时正常，接近 1.0 时关注数值稳定性
 
@@ -531,7 +658,8 @@ BaiZe/
 │   ├── corpus.txt             # 预训练语料（示例）
 │   └── sft.jsonl              # SFT 数据（示例）
 ├── docs/
-│   └── allenai_data.md        # AllenAI 数据接入说明（下载哪些数据、数据量控制）
+│   ├── allenai_data.md        # AllenAI 数据接入说明（下载哪些数据、数据量控制）
+│   └── training_report_0.1b.md # 0.13B 实测报告（配置、训练曲线、评测、结论）
 ├── tests/                     # 测试（python tests/test_*.py；CI 见 .github/workflows/tests.yml）
 └── requirements.txt
 ```

@@ -10,6 +10,7 @@ pretrain.py / sft.py / dpo.py 共用：
     - 激活重计算（--grad_checkpoint 1）、ACT 延后启用（--act_start_step N）
     - 梯度累积时非最后一个 micro-batch 跳过梯度同步（DDP no_sync / FSDP set_requires_gradient_sync）
     - 断点文件先写临时文件再原子替换，中途被杀不会损坏旧断点
+    - 可选 Weights & Biases 记录（--use_wandb 1）；续训时接着写同一个 run
 """
 
 import math
@@ -54,7 +55,54 @@ def add_train_args(parser, learning_rate=5e-4, epochs=2):
     g.add_argument("--act_start_step", type=int, default=None,
                    help="前 N 步关闭 ACT（跑满所有圈），之后再启用早停；默认总步数的 10%%，0 = 一开始就启用")
     g.add_argument("--seed", type=int, default=42)
+    w = parser.add_argument_group("Weights & Biases")
+    w.add_argument("--use_wandb", type=int, default=0, choices=[0, 1], help="把训练指标记录到 wandb（需 pip install wandb）")
+    w.add_argument("--wandb_project", type=str, default="baize")
+    w.add_argument("--wandb_entity", type=str, default=None, help="团队/用户名，默认用 wandb 登录账号")
+    w.add_argument("--wandb_run_name", type=str, default=None, help="默认 <save_weight>-<时间>")
+    w.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"],
+                   help="offline：只写本地 wandb/ 目录，之后用 wandb sync 上传（无外网时用）")
     return g
+
+
+class WandbLogger:
+    """wandb 的薄封装：只在主进程启用；未安装或初始化失败时打印警告并降级为空操作，不影响训练。"""
+
+    def __init__(self, args, config, save_weight, run_id=None):
+        self.run = None
+        self.run_id = run_id
+        if not getattr(args, "use_wandb", 0) or not is_main_process():
+            return
+        try:
+            import wandb
+        except ImportError:
+            Logger("[warning] --use_wandb 1 但未安装 wandb（pip install wandb），本次不记录")
+            return
+        name = args.wandb_run_name or f"{save_weight}-{time.strftime('%m%d-%H%M')}"
+        try:
+            self.run = wandb.init(
+                project=args.wandb_project, entity=args.wandb_entity, name=name, mode=args.wandb_mode,
+                id=run_id, resume="allow" if run_id else None, dir=args.save_dir,
+                config={"stage": save_weight, "train": vars(args), "model": config.to_dict()},
+            )
+        except Exception as exc:  # 网络 / 鉴权问题不应中断训练
+            Logger(f"[warning] wandb 初始化失败，本次不记录：{type(exc).__name__}: {exc}")
+            return
+        self.run_id = self.run.id
+        Logger(f"wandb: {args.wandb_project}/{name}（id={self.run_id}，mode={args.wandb_mode}）")
+
+    def log(self, metrics: dict, step: int):
+        if self.run is not None:
+            self.run.log(metrics, step=step)
+
+    def summary(self, **kv):
+        if self.run is not None:
+            self.run.summary.update(kv)
+
+    def finish(self):
+        if self.run is not None:
+            self.run.finish()
+            self.run = None
 
 
 class Trainer:
@@ -94,10 +142,12 @@ class Trainer:
         self.act_enabled = bool(config.use_act)
         self.step = 0
         resume = None
+        self.wandb_id = None
         if args.from_resume and os.path.exists(self.ckpt_path):
             resume = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
             self.raw.load_state_dict(resume["model"], strict=False)
             self.step = resume["step"]
+            self.wandb_id = resume.get("wandb_id")
             Logger(f"断点续训: {self.ckpt_path} step={self.step}")
 
         if self.use_fsdp:
@@ -187,6 +237,11 @@ class Trainer:
         Logger(f"每 epoch {steps_per_epoch} 步，共 {total} 步，warmup {warmup} 步，"
                f"每步 {samples_per_step} 个样本" + (f"，ACT 自第 {act_start} 步启用" if self.act_enabled else ""))
 
+        self.wandb = WandbLogger(args, self.config, self.save_weight, run_id=self.wandb_id)
+        self.wandb_id = self.wandb.run_id
+        self.wandb.summary(total_steps=total, samples_per_step=samples_per_step, act_start_step=act_start,
+                           params_m=sum(p.numel() for p in self.raw.parameters()) / 1e6)
+
         start_epoch = self.step // steps_per_epoch
         skip_micro = (self.step % steps_per_epoch) * acc
         start_time, start_step = time.time(), self.step
@@ -238,6 +293,16 @@ class Trainer:
                         Logger(f"step:{self.step}/{total} {parts} lr:{lr:.2e} gnorm:{float(grad_norm):.2f} "
                                f"loops:{float(loops) if loops is not None else 0:.2f} ρ(A):{rho:.3f} "
                                f"eta:{eta:.1f}min")
+                        metrics = {f"train/{k}": v for k, v in log_acc.items()}
+                        metrics.update({
+                            "train/lr": lr, "train/grad_norm": float(grad_norm), "train/rho_A": rho,
+                            "train/samples": self.step * samples_per_step,
+                            "train/steps_per_sec": (self.step - start_step) / max(spend, 1e-6),
+                            "act/enabled": float(self.raw.config.use_act),
+                        })
+                        if loops is not None:
+                            metrics["act/avg_loops"] = float(loops)
+                        self.wandb.log(metrics, step=self.step)
                 log_acc = {}
                 if self.step % args.save_interval == 0:
                     self.save_checkpoint()
@@ -264,6 +329,7 @@ class Trainer:
             tmp = self.ckpt_path + ".tmp"
             torch.save({"model": model_sd, "optimizer": optim_sd, "scaler": self.scaler.state_dict(),
                         "step": self.step, "config": self.config.to_dict(),
+                        "wandb_id": getattr(self, "wandb_id", None),
                         "mode": "fsdp" if self.use_fsdp else "standard"}, tmp)
             os.replace(tmp, self.ckpt_path)
         if self.distributed:
@@ -300,6 +366,8 @@ class Trainer:
             path = save_weights(model_sd, os.path.join(self.args.save_dir, f"{self.save_weight}.safetensors"))
             self._save_config(self.args.save_dir)
             Logger(f"训练完成，权重保存至 {path}")
+        if getattr(self, "wandb", None) is not None:
+            self.wandb.finish()
         if self.distributed:
             dist.barrier()
             dist.destroy_process_group()

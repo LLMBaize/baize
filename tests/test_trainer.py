@@ -107,6 +107,66 @@ def test_resume_matches_uninterrupted():
             assert torch.allclose(ref[k].float(), out[k].float(), atol=1e-3), k
 
 
+class _FakeWandb:
+    """替代 wandb 模块：记录 init 参数与每次 log，不联网。"""
+
+    def __init__(self):
+        self.inits, self.logs, self.finished = [], [], 0
+
+    def init(self, **kw):
+        self.inits.append(kw)
+        fake = self
+
+        class Run:
+            id = kw.get("id") or "run123"
+            summary = {}
+
+            def log(self, metrics, step):
+                fake.logs.append((step, dict(metrics)))
+
+            def finish(self):
+                fake.finished += 1
+        return Run()
+
+
+def test_wandb_logging_and_resume_same_run():
+    fake = _FakeWandb()
+    sys.modules["wandb"] = fake
+    try:
+        ds = RandomTokens()
+        with tempfile.TemporaryDirectory() as d:
+            extra = ("--use_wandb", "1", "--log_interval", "2", "--max_steps", "4")
+            Trainer(make_args(d, *extra), BaiZeForCausalLM(tiny_config()), tiny_config(), "pretrain") \
+                .fit(ds, lm_loss_fn())
+            assert fake.inits[0]["project"] == "baize" and fake.inits[0]["id"] is None
+            assert fake.inits[0]["config"]["model"]["hidden_size"] == 32
+            assert [s for s, _ in fake.logs] == [2, 4]
+            keys = set(fake.logs[0][1])
+            assert {"train/loss", "train/lr", "train/grad_norm", "train/rho_A", "act/avg_loops"} <= keys, keys
+            assert fake.finished == 1
+            assert torch.load(os.path.join(d, "ckpt_pretrain.pt"), weights_only=False)["wandb_id"] == "run123"
+
+            # 续训：接着写同一个 run，step 从断点继续
+            Trainer(make_args(d, "--use_wandb", "1", "--log_interval", "2", "--max_steps", "6",
+                              "--from_resume", "1"),
+                    BaiZeForCausalLM(tiny_config()), tiny_config(), "pretrain").fit(ds, lm_loss_fn())
+            assert fake.inits[1]["id"] == "run123" and fake.inits[1]["resume"] == "allow"
+            assert [s for s, _ in fake.logs[2:]] == [6]
+    finally:
+        del sys.modules["wandb"]
+
+
+def test_wandb_missing_does_not_break_training():
+    sys.modules["wandb"] = None  # import wandb → ImportError
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            Trainer(make_args(d, "--use_wandb", "1", "--max_steps", "2"), BaiZeForCausalLM(tiny_config()),
+                    tiny_config(), "pretrain").fit(RandomTokens(), lm_loss_fn())
+            assert os.path.exists(os.path.join(d, "pretrain.safetensors"))
+    finally:
+        del sys.modules["wandb"]
+
+
 def test_token_bin_dataset_caps_and_alignment():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "x.bin")
