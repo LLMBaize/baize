@@ -32,7 +32,7 @@ from torch.utils.data import Dataset
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from baize import BaiZeTokenizer
-from baize.trainer import Trainer, add_train_args
+from baize.trainer import Trainer, add_train_args, finetune_defaults
 from baize.trainer_utils import Logger, log_model_params
 from sft import load_base_model
 
@@ -120,7 +120,7 @@ def main():
     d.add_argument("--tokenizer", type=str, default="tokenizer")
     d.add_argument("--max_samples", type=int, default=None, help="最多使用多少对偏好样本（控制数据量）")
     d.add_argument("--max_seq_len", type=int, default=512)
-    d.add_argument("--n_loops_train", type=int, default=None)
+    d.add_argument("--n_loops_train", type=int, default=None, help="训练圈数；默认沿用预训练（config.n_loops_train）")
     d.add_argument("--beta", type=float, default=0.1, help="DPO 温度 β：越大越贴近参考模型")
     d.add_argument("--save_weight", type=str, default="dpo")
     d.add_argument("--from_weight", type=str, default="sft", help="策略与参考模型的初始权重（通常是 SFT）")
@@ -137,13 +137,13 @@ def main():
     for p in ref_model.parameters():
         p.requires_grad_(False)
 
+    n_loops = finetune_defaults(args, config)
     trainer = Trainer(args, model, config, save_weight=args.save_weight)
     ref_model.to(trainer.device)
     files = sorted(f for pat in args.data.split(",") for f in glob.glob(pat.strip()))
     if not files:
         raise FileNotFoundError(f"未找到 DPO 数据: {args.data}")
     ds = DPODataset(files, tokenizer, args.max_seq_len, max_samples=args.max_samples)
-    n_loops = args.n_loops_train or config.max_loop_iters
     trainer.fit(ds, dpo_loss_fn(ref_model, args.beta, n_loops), collate_fn=dpo_collate)
 
 

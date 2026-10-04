@@ -30,6 +30,7 @@ class BaiZeConfig(PretrainedConfig):
         prelude_layers: int = 2,        # 循环前的一次性层
         coda_layers: int = 2,           # 循环后的一次性层
         max_loop_iters: int = 8,        # 默认循环圈数 T
+        n_loops_train: int = None,      # 预训练实际使用的圈数（SFT/DPO 默认沿用）；None = max_loop_iters
         # ---- 注意力 ----
         attn_type: str = "gqa",         # "gqa" | "mla"
         num_attention_heads: int = 8,
@@ -79,6 +80,7 @@ class BaiZeConfig(PretrainedConfig):
         self.prelude_layers = prelude_layers
         self.coda_layers = coda_layers
         self.max_loop_iters = max_loop_iters
+        self.n_loops_train = n_loops_train
 
         self.attn_type = attn_type
         self.num_attention_heads = num_attention_heads

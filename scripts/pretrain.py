@@ -127,6 +127,7 @@ def main():
         prelude_layers=args.prelude_layers,
         coda_layers=args.coda_layers,
         max_loop_iters=args.max_loop_iters,
+        n_loops_train=n_loops_train,
         max_position_embeddings=max(args.max_seq_len * 4, 4096),
         attn_type=args.attn_type,
         use_moe=bool(args.use_moe),

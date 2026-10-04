@@ -42,7 +42,9 @@ def add_train_args(parser, learning_rate=5e-4, epochs=2):
     g.add_argument("--accumulation_steps", type=int, default=1)
     g.add_argument("--grad_clip", type=float, default=1.0)
     g.add_argument("--log_interval", type=int, default=20)
-    g.add_argument("--save_interval", type=int, default=200)
+    g.add_argument("--save_interval", type=int, default=200, help="断点保存间隔（覆盖式，只留最新）")
+    g.add_argument("--snapshot_interval", type=int, default=0,
+                   help="每 N 步额外保存一份 fp16 权重快照到 <save_dir>/snapshots/step_XXXXXX/，0=不保存")
     g.add_argument("--max_steps", type=int, default=None, help="最多训练多少个优化步（与 epochs 取较小者）")
     g.add_argument("--warmup_steps", type=int, default=None, help="学习率 warmup 步数，默认总步数的 1%%")
     g.add_argument("--from_resume", type=int, default=0, choices=[0, 1], help="从断点续训")
@@ -239,6 +241,8 @@ class Trainer:
                 log_acc = {}
                 if self.step % args.save_interval == 0:
                     self.save_checkpoint()
+                if args.snapshot_interval and self.step % args.snapshot_interval == 0:
+                    self.save_snapshot()
         self.save_checkpoint()
         self.save_final()
 
@@ -265,16 +269,55 @@ class Trainer:
         if self.distributed:
             dist.barrier()
 
+    def _model_state(self):
+        """完整的模型 state dict；FSDP 下为集合通信（所有 rank 都要调用），只有 rank0 拿到内容。"""
+        if self.use_fsdp:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+            return get_model_state_dict(self.raw, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        return self.raw
+
+    def _save_config(self, directory):
+        current = self.config.use_act
+        self.config.use_act = self.act_enabled  # ACT 延后启用期间也按最终设置保存
+        self.config.save_pretrained(directory)
+        self.config.use_act = current
+
+    def save_snapshot(self):
+        """独立的权重快照（不含优化器状态，不会被覆盖），可直接用于推理 / SFT / 评测。"""
+        state = self._model_state()
+        if is_main_process():
+            d = os.path.join(self.args.save_dir, "snapshots", f"step_{self.step:06d}")
+            os.makedirs(d, exist_ok=True)
+            save_weights(state, os.path.join(d, f"{self.save_weight}.safetensors"))
+            self._save_config(d)
+            Logger(f"权重快照 → {d}")
+        if self.distributed:
+            dist.barrier()
+
     def save_final(self):
-        model_sd = self._full_state()[0] if self.use_fsdp else self.raw
+        model_sd = self._model_state()
         if is_main_process():
             path = save_weights(model_sd, os.path.join(self.args.save_dir, f"{self.save_weight}.safetensors"))
-            self.config.use_act = self.act_enabled
-            self.config.save_pretrained(self.args.save_dir)
+            self._save_config(self.args.save_dir)
             Logger(f"训练完成，权重保存至 {path}")
         if self.distributed:
             dist.barrier()
             dist.destroy_process_group()
+
+
+def finetune_defaults(args, config):
+    """SFT / DPO 从预训练权重继续训练时的默认值，返回训练圈数。
+
+    - 圈数沿用预训练（config.n_loops_train），而不是 max_loop_iters：换圈数会改变模型的计算图，
+      微调初期 loss 会先被抬高、还白白多花算力。
+    - ACT 停机头已在预训练中学好，act_start_step 默认 0（一开始就启用），
+      否则前 10% 步关掉 ACT、输出改取最后一圈，等启用时又切回加权输出，分布来回跳。
+    """
+    n_loops = args.n_loops_train or getattr(config, "n_loops_train", None) or config.max_loop_iters
+    if getattr(args, "from_weight", "none") != "none" and args.act_start_step is None:
+        args.act_start_step = 0
+    Logger(f"训练圈数: {n_loops}（max_loop_iters={config.max_loop_iters}），ACT 自第 {args.act_start_step} 步启用")
+    return n_loops
 
 
 def lm_loss_fn(n_loops=None):
