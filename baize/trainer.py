@@ -305,6 +305,21 @@ class Trainer:
             dist.destroy_process_group()
 
 
+def finetune_defaults(args, config):
+    """SFT / DPO 从预训练权重继续训练时的默认值，返回训练圈数。
+
+    - 圈数沿用预训练（config.n_loops_train），而不是 max_loop_iters：换圈数会改变模型的计算图，
+      微调初期 loss 会先被抬高、还白白多花算力。
+    - ACT 停机头已在预训练中学好，act_start_step 默认 0（一开始就启用），
+      否则前 10% 步关掉 ACT、输出改取最后一圈，等启用时又切回加权输出，分布来回跳。
+    """
+    n_loops = args.n_loops_train or getattr(config, "n_loops_train", None) or config.max_loop_iters
+    if getattr(args, "from_weight", "none") != "none" and args.act_start_step is None:
+        args.act_start_step = 0
+    Logger(f"训练圈数: {n_loops}（max_loop_iters={config.max_loop_iters}），ACT 自第 {args.act_start_step} 步启用")
+    return n_loops
+
+
 def lm_loss_fn(n_loops=None):
     """预训练 / SFT 的损失：交叉熵 + aux（MoE 均衡 + ACT ponder）。"""
 

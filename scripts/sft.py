@@ -25,7 +25,7 @@ from torch.utils.data import Dataset
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from baize import BaiZeConfig, BaiZeForCausalLM, BaiZeTokenizer
-from baize.trainer import Trainer, add_train_args, lm_loss_fn
+from baize.trainer import Trainer, add_train_args, finetune_defaults, lm_loss_fn
 from baize.trainer_utils import Logger, load_weights, log_model_params
 
 
@@ -95,7 +95,7 @@ def main():
     d.add_argument("--tokenizer", type=str, default="tokenizer")
     d.add_argument("--max_samples", type=int, default=None, help="最多使用多少条有效对话（控制数据量）")
     d.add_argument("--max_seq_len", type=int, default=512)
-    d.add_argument("--n_loops_train", type=int, default=None)
+    d.add_argument("--n_loops_train", type=int, default=None, help="训练圈数；默认沿用预训练（config.n_loops_train）")
     d.add_argument("--save_weight", type=str, default="sft")
     d.add_argument("--from_weight", type=str, default="pretrain", help="预训练权重名（none=从零）")
     d.add_argument("--config_dir", type=str, default=None, help="模型 config.json 所在目录，默认同 save_dir")
@@ -106,12 +106,13 @@ def main():
     model, config = load_base_model(args, tokenizer)
     log_model_params(model)
 
+    n_loops = finetune_defaults(args, config)
     trainer = Trainer(args, model, config, save_weight=args.save_weight)
     files = sorted(f for pat in args.data.split(",") for f in glob.glob(pat.strip()))
     if not files:
         raise FileNotFoundError(f"未找到 SFT 数据: {args.data}")
     train_ds = SFTDataset(files, tokenizer, args.max_seq_len, max_samples=args.max_samples)
-    trainer.fit(train_ds, lm_loss_fn(args.n_loops_train or config.max_loop_iters), collate_fn=collate_fn)
+    trainer.fit(train_ds, lm_loss_fn(n_loops), collate_fn=collate_fn)
 
 
 if __name__ == "__main__":
