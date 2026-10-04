@@ -33,6 +33,7 @@ $$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + 
 - [RDT 训练建议](#rdt-训练建议)
 - [目录结构](#目录结构)
 - [常见问题](#常见问题)
+- [许可证](#许可证)
 
 ---
 
@@ -661,7 +662,8 @@ BaiZe/
 │   ├── allenai_data.md        # AllenAI 数据接入说明（下载哪些数据、数据量控制）
 │   └── training_report_0.1b.md # 0.13B 实测报告（配置、训练曲线、评测、结论）
 ├── tests/                     # 测试（python tests/test_*.py；CI 见 .github/workflows/tests.yml）
-└── requirements.txt
+├── requirements.txt
+└── LICENSE                    # MIT 许可证
 ```
 
 ---
@@ -722,3 +724,12 @@ A：用 `--from_weight <name>` 加载已有 safetensors 权重（新的优化器
 - [Adaptive Computation Time](https://arxiv.org/abs/1603.08983) —— ACT 早停与 ponder cost
 - [DPO](https://arxiv.org/abs/2305.18290) —— 直接偏好优化
 - [Tulu 3](https://arxiv.org/abs/2411.15124) —— AllenAI 开放后训练数据与配方
+
+---
+
+## 许可证
+
+本项目代码以 [MIT License](LICENSE) 开源。
+
+训练数据不在此许可范围内：通过 `prepare_allenai.py` 下载的 AllenAI 数据集（C4 / mC4、OLMo mix、Tulu 3 等）
+各自遵循其原始许可（多为 ODC-BY），使用前请查阅 [docs/allenai_data.md](docs/allenai_data.md) 与各数据集页面。
