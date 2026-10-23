@@ -24,3 +24,21 @@ jobs:
             echo "=== $t"
             python "$t"
           done
+
+  megatron-core:
+    # Megatron-core 版（scripts/pretrain_mcore.py）的 CPU 冒烟测试：模型等价、TP=2/DP=2、续训、权重导出
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies (CPU torch + megatron-core)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install "megatron-core==0.16.1"
+      - name: Run Megatron-core smoke tests
+        run: python tests/test_mcore.py

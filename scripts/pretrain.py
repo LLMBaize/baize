@@ -82,8 +82,8 @@ def build_dataset(args, tokenizer):
     return PretrainDataset(files, tokenizer, args.max_seq_len, max_docs=args.max_docs, max_tokens=args.max_tokens)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="BaiZe Pretrain")
+def add_data_model_args(parser):
+    """数据与模型结构参数（pretrain.py 与 pretrain_mcore.py 共用）。"""
     d = parser.add_argument_group("数据")
     d.add_argument("--data", type=str, default="data/corpus*.txt",
                    help="语料 glob：.bin（推荐）或 .txt/.jsonl，可用逗号分隔多个")
@@ -112,13 +112,12 @@ def main():
     m.add_argument("--use_act", type=int, default=1, choices=[0, 1])
     m.add_argument("--act_init_bias", type=float, default=-3.0)
     m.add_argument("--act_ponder_coef", type=float, default=1e-3)
-    add_train_args(parser, learning_rate=5e-4, epochs=2)
-    args = parser.parse_args()
 
-    tokenizer = BaiZeTokenizer.from_pretrained(args.tokenizer)
+
+def config_from_args(args, vocab_size):
     n_loops_train = args.n_loops_train or args.max_loop_iters
-    config = BaiZeConfig(
-        vocab_size=tokenizer.vocab_size,
+    return BaiZeConfig(
+        vocab_size=vocab_size,
         hidden_size=args.hidden_size,
         num_attention_heads=args.num_attention_heads,
         num_key_value_heads=args.num_key_value_heads,
@@ -139,6 +138,17 @@ def main():
         act_init_bias=args.act_init_bias,
         act_ponder_coef=args.act_ponder_coef,
     )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="BaiZe Pretrain")
+    add_data_model_args(parser)
+    add_train_args(parser, learning_rate=5e-4, epochs=2)
+    args = parser.parse_args()
+
+    tokenizer = BaiZeTokenizer.from_pretrained(args.tokenizer)
+    config = config_from_args(args, tokenizer.vocab_size)
+    n_loops_train = config.n_loops_train
     model = BaiZeForCausalLM(config)
     if args.from_weight != "none":
         wp = os.path.join(args.save_dir, f"{args.from_weight}.safetensors")

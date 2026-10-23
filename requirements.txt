@@ -7,6 +7,8 @@ numpy
 
 # 可选：AllenAI 数据下载（prepare_allenai.py）与标准评测集（eval.py --mode bench）
 datasets>=2.19
+# 可选：Megatron-core 版训练（scripts/pretrain_mcore.py）；兼容补丁按 0.16.1 编写并测试
+# megatron-core==0.16.1
 # 可选：训练指标记录到 Weights & Biases（--use_wandb 1）
 # wandb
 # 可选：scripts/demo.py --web

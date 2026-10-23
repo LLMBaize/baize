@@ -29,6 +29,7 @@ $$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + 
 - [使用 AllenAI 数据](#使用-allenai-数据)
 - [实测报告：0.13B](#实测报告013b)
 - [参数使用指南](#参数使用指南)
+- [Megatron-core 版训练](#megatron-core-版训练)
 - [训练参数详解](#训练参数详解)
 - [RDT 训练建议](#rdt-训练建议)
 - [目录结构](#目录结构)
@@ -476,6 +477,23 @@ wandb sync out/wandb/offline-run-*
 
 ---
 
+## Megatron-core 版训练
+
+`scripts/pretrain_mcore.py` 用 Megatron-core 重写了预训练，支持**张量并行**（自动开启序列并行）、Megatron DDP 和分布式优化器。
+模型结构、数据、超参与原版完全一致，训练结束导出原版格式的 `pretrain.safetensors`，`eval.py`、`demo.py`、`sft.py` 可以直接使用。
+
+```bash
+pip install "megatron-core==0.16.1"
+torchrun --nproc_per_node 8 scripts/pretrain_mcore.py --data data/pretrain.bin ...模型参数同 pretrain.py... \
+    --tensor_parallel_size 2 --use_distributed_optimizer 1 --bf16 1
+```
+
+在 CPU 冒烟测试中（`python tests/test_mcore.py`），同一初始权重下，TP=1、TP=2、DP=2 以及中断续训的每步 loss 都与原版 `pretrain.py` 一致。
+实现对照、参数、验证结果和限制见 **[docs/megatron_core.md](docs/megatron_core.md)**。
+注意：开发环境没有 GPU，bf16 和分布式优化器路径还没有在 GPU 上运行过。
+
+---
+
 ## 训练参数详解
 
 ### 数据参数
@@ -639,12 +657,14 @@ BaiZe/
 │   ├── data.py                # 语料读取（.txt/.jsonl）、memmap .bin 数据集、可续训采样器
 │   ├── trainer.py             # 通用训练循环：warmup / 续训 / DDP / FSDP2 / 激活重计算
 │   ├── benchmarks.py          # 标准评测：ARC / MMLU / C-Eval / HellaSwag / GSM8K / 本地 jsonl
-│   └── trainer_utils.py       # LR schedule / 分布式初始化 / 日志 / 权重 IO（严格校验）
+│   ├── trainer_utils.py       # LR schedule / 分布式初始化 / 日志 / 权重 IO（严格校验）
+│   └── mcore/                 # Megatron-core 版：model.py（TP/SP 组件实现的 RDT）、convert.py（权重互转 / TP 切分）、compat.py
 ├── scripts/
 │   ├── prepare_allenai.py     # AllenAI 预训练 / SFT / 偏好数据流式下载、混合、过滤、配额控制
 │   ├── train_tokenizer.py     # BPE 分词器训练
 │   ├── tokenize_corpus.py     # 预分词 → memmap .bin（大语料训练用）
 │   ├── pretrain.py            # 预训练
+│   ├── pretrain_mcore.py      # 预训练（Megatron-core：张量并行 / Megatron DDP / 分布式优化器）
 │   ├── sft.py                 # 指令微调（prompt mask / 多轮对话）
 │   ├── dpo.py                 # 偏好对齐（DPO）
 │   ├── eval.py                # 困惑度 / 对话 / 标准评测（支持 --loops 深度外推）
@@ -660,7 +680,8 @@ BaiZe/
 │   └── sft.jsonl              # SFT 数据（示例）
 ├── docs/
 │   ├── allenai_data.md        # AllenAI 数据接入说明（下载哪些数据、数据量控制）
-│   └── training_report_0.1b.md # 0.13B 实测报告（配置、训练曲线、评测、结论）
+│   ├── training_report_0.1b.md # 0.13B 实测报告（配置、训练曲线、评测、结论）
+│   └── megatron_core.md       # Megatron-core 版训练：实现对照、用法、验证、限制
 ├── tests/                     # 测试（python tests/test_*.py；CI 见 .github/workflows/tests.yml）
 ├── requirements.txt
 └── LICENSE                    # MIT 许可证
