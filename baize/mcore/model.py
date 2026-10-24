@@ -203,11 +203,11 @@ def _block_spec(use_moe: bool, num_experts: int, num_layers: int, mla: bool = Fa
                                       layer_norm=RMSNormSP)
 
 
-def rope_freqs(seq_len: int, dim: int, theta: float, device, offset: int = 0):
+def rope_freqs(seq_len: int, dim: int, theta: float, device):
     """Megatron 格式的 RoPE 频率 [s, 1, 1, dim]（与原版 precompute_freqs_cis 同一组频率、同为非交错式）。
     不用 megatron 的 RotaryEmbedding：它的 forward 写死了 CUDA 设备。"""
     inv = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-    t = torch.arange(offset, offset + seq_len, dtype=torch.float32, device=device)
+    t = torch.arange(seq_len, dtype=torch.float32, device=device)
     freqs = torch.outer(t, inv)
     return torch.cat([freqs, freqs], dim=-1)[:, None, None, :]
 

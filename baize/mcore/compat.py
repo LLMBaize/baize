@@ -47,10 +47,6 @@ def enable_cpu_smoke_mode():
     torch.cuda.manual_seed = lambda seed: None
     torch.cuda.manual_seed_all = lambda seed: None
     torch.cuda.synchronize = lambda device=None: None
-    torch.cuda.Stream = _FakeStream
-    torch.cuda.Event = _FakeStream
-    torch.cuda.current_stream = lambda device=None: _FakeStream()
-    torch.cuda.stream = lambda stream=None: _FakeStream()
 
     import megatron.core.tensor_parallel.random as mrandom
 
@@ -82,22 +78,6 @@ def enable_cpu_smoke_mode():
     # LanguageModule.setup_embeddings_and_output_layer 在 PP 下对词嵌入做 weight.data.cuda()：CPU 模式下 Tensor.cuda 是恒等函数
     torch.Tensor.cuda = lambda self, *a, **k: self
     _CPU_MODE = True
-
-
-class _FakeStream:
-    """CPU 上没有 CUDA stream / event：提供空实现，让 alltoall 分发器等代码路径可以执行。"""
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def __getattr__(self, name):
-        return lambda *a, **k: _FakeStream()  # record_event() 等返回可再次 synchronize 的对象
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
 
 
 class _CpuTorchProxy:
