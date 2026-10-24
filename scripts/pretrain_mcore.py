@@ -384,7 +384,7 @@ def main():
                              "act/enabled": float(cfg.use_act),
                              "train/samples": step * args.batch_size * acc * dp_size,
                              "train/steps_per_sec": (step - step0) / max(elapsed, 1e-6)}, step=step)
-            if step % args.save_interval == 0:
+            if step % args.save_interval == 0 and step < total:  # 最后一步由循环后的 save_checkpoint 统一保存
                 save_checkpoint(args, step, model, optimizer, tracker.run_id)
             if args.exit_interval and step % args.exit_interval == 0 and step < total:
                 if step % args.save_interval:

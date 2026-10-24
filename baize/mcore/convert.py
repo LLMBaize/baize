@@ -250,6 +250,8 @@ def shard_tp(full, cfg, rank, size):
     out = {}
     for k, v in full.items():
         if _COL.search(k):
+            if v.shape[0] % size:
+                raise ValueError(f"张量并行 {size} 无法切分 {k}（输出维 {v.shape[0]}）")
             out[k] = v.chunk(size, dim=0)[rank]
         elif _GLU.search(k):
             g, u = v.chunk(2, dim=0)
