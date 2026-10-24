@@ -147,8 +147,6 @@ def save_checkpoint(args, step, model, optimizer, wandb_id):
 
 def load_checkpoint(args, model, optimizer):
     """返回 (step, wandb_id)；没有断点时返回 (0, None)。"""
-    from megatron.core import parallel_state as ps
-
     latest = os.path.join(_ckpt_root(args), "latest.json")
     if not os.path.exists(latest):
         Logger(f"[warning] 未找到断点 {latest}，从头训练")
