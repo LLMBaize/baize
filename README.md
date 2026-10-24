@@ -95,7 +95,7 @@ $$h_{t+1} = A\,h_t + B\,e + \mathrm{Block}\big(\mathrm{RMSNorm}(h_t + e)\big) + 
 ### 训练工程
 
 - **预分词 memmap 数据**：`scripts/tokenize_corpus.py` → `.bin`，训练时零拷贝读取，不占内存、启动零等待
-- **统一训练循环** `baize/trainer.py`（pretrain / sft / dpo 共用）：
+- **统一训练循环** `baize/trainer.py`（pretrain 原版后端 / sft / dpo 共用；Megatron 后端的循环在 `baize/mcore/train.py`）：
   - 线性 warmup + 余弦退火（`--warmup_steps`，默认总步数 1%）
   - 可续训采样器：单卡也打乱；续训从中断处下一个 batch 精确继续（测试验证：中断续训与不中断结果一致）
   - 续训在 `torch.compile` / DDP / FSDP 包装前加载，修复 `--use_compile` 下无法续训
@@ -479,16 +479,59 @@ wandb sync out/wandb/offline-run-*
 
 ## Megatron-core 版训练
 
-预训练只有一个入口 `scripts/pretrain.py`，用 `--backend` 选择训练后端：`native`（默认，原版循环）或 `megatron`（Megatron-core）。Megatron 后端支持**张量并行**（自动开启序列并行）、**专家并行**（`--expert_parallel_size`）、**流水线并行**（`--pipeline_parallel_size`，2 段）、**MLA 注意力**（`--attn_type mla`）、Megatron DDP 和分布式优化器。
+预训练只有一个入口 `scripts/pretrain.py`，用 `--backend` 选择训练后端：
+
+- `--backend native`（默认）：原版训练循环（`baize/trainer.py`），支持单卡 / DDP / FSDP2。
+- `--backend megatron`：Megatron-core 训练循环（`baize/mcore/train.py`），支持张量并行（TP，自动开启序列并行）、专家并行（EP）、两段流水线并行（PP）、MLA 注意力、Megatron DDP 和分布式优化器。
+
 模型结构、数据、超参与原版完全一致，训练结束导出原版格式的 `pretrain.safetensors`，`eval.py`、`demo.py`、`sft.py` 可以直接使用。
 
 ```bash
 pip install "megatron-core==0.16.1"
+
+# 8 卡：张量并行 2 × 数据并行 4，分布式优化器
 torchrun --nproc_per_node 8 scripts/pretrain.py --backend megatron --data data/pretrain.bin ...模型参数同原版... \
-    --tensor_parallel_size 2 --use_distributed_optimizer 1 --bf16 1
+    --tensor_parallel_size 2 --use_distributed_optimizer 1
+
+# 8 卡：专家并行 4 × 数据并行 2
+torchrun --nproc_per_node 8 scripts/pretrain.py --backend megatron ...同上... --expert_parallel_size 4
+
+# 4 卡：流水线并行 2 × 数据并行 2（第一段：词嵌入 + Prelude；第二段：循环块 + Coda + 输出层）
+torchrun --nproc_per_node 4 scripts/pretrain.py --backend megatron ...同上... --pipeline_parallel_size 2
+
+# 续训 / 从原版权重初始化
+torchrun ... scripts/pretrain.py --backend megatron ...同上... --from_resume 1
+python scripts/pretrain.py --backend megatron ...同上... --from_weight pretrain
 ```
 
-在 CPU 冒烟测试中（`python tests/test_mcore.py`），同一初始权重下，TP=1、TP=2、DP=2、EP=2、PP=2 以及中断续训的每步 loss 都与原版 `pretrain.py` 一致（GQA 与 MLA 两种注意力都覆盖）。
+并行方式的关系是 `WORLD_SIZE = TP × PP × DP`，EP 位于 DP 组内、不增加进程数；每步样本数 = `batch_size × accumulation_steps × DP`。详细规则和常见组合见 **[docs/megatron_core.md](docs/megatron_core.md)**。
+
+Megatron 后端专用参数（原版后端会忽略）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--tensor_parallel_size` | 1 | 张量并行度；要求整除 `num_key_value_heads` |
+| `--expert_parallel_size` | 1 | 专家并行度；要求整除 `n_experts` |
+| `--pipeline_parallel_size` | 1 | 流水线段数，只能是 1 或 2 |
+| `--moe_dispatcher` | allgather | `allgather`（CPU 可测）或 `alltoall`（仅 GPU，未验证） |
+| `--use_distributed_optimizer` | 0 | 优化器状态在 DP 组内切分（ZeRO-1），仅 GPU |
+| `--bf16` | 1 | bf16 训练（fp32 主权重） |
+| `--exit_interval` | — | 到达该步数的整数倍时存断点并退出，用于分段训练 |
+| `--cpu_smoke` | 0 | 无 GPU 的冒烟测试（CPU + gloo），检测到 GPU 会报错 |
+
+断点按 `(TP, EP, PP)` 坐标保存，续训时三者必须与保存时一致。训练结束导出的 `pretrain.safetensors` 与原版后端格式相同。
+
+CPU 冒烟测试（无 GPU）：
+
+```bash
+python scripts/pretrain.py --backend megatron --cpu_smoke 1 --data data/corpus.txt --tokenizer demo_weights \
+    --max_steps 10 --batch_size 4 --accumulation_steps 2 --hidden_size 64 --num_attention_heads 4 \
+    --num_key_value_heads 2 --head_dim 16 --intermediate_size 128 --moe_intermediate_size 32 --n_experts 4 \
+    --max_loop_iters 4 --n_loops_train 3 --max_seq_len 64 --use_moe 1
+python tests/test_mcore.py   # 完整检查：等价性、TP/DP/EP/PP 的 loss 与导出、续训
+```
+
+在 CPU 冒烟测试中（`python tests/test_mcore.py`），同一初始权重下，TP=1、TP=2、DP=2、EP=2、PP=2 以及中断续训的每步 loss 都与原版 `pretrain.py --backend native` 一致（GQA 与 MLA 两种注意力都覆盖）。
 实现对照、参数、验证结果和限制见 **[docs/megatron_core.md](docs/megatron_core.md)**。
 注意：开发环境没有 GPU，bf16、分布式优化器、NCCL 通信与 `--moe_dispatcher alltoall` 还没有在 GPU 上运行过。
 
@@ -510,7 +553,7 @@ torchrun --nproc_per_node 8 scripts/pretrain.py --backend megatron --data data/p
 | `--beta` | dpo | 0.1 | DPO 温度 |
 | `--n_loops_train` | sft / dpo | 沿用预训练 | 训练圈数；默认读取 `config.json` 里的 `n_loops_train`，没有则用 `max_loop_iters` |
 
-### 训练参数（pretrain / sft / dpo 共用，见 `baize/trainer.py`）
+### 训练参数（pretrain / sft / dpo 共用，见 `baize/trainer.py`；pretrain 的两个后端共用这组默认值）
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -655,10 +698,11 @@ BaiZe/
 │   ├── model.py               # RDT 模型：GQA/MLA、MoE、LTI、ACT、LoRA、圈数嵌入
 │   ├── tokenizer.py           # BPE 训练 + 封装（含对话模板，v2 精确边界定位）
 │   ├── data.py                # 语料读取（.txt/.jsonl）、memmap .bin 数据集、可续训采样器
+│   ├── pretrain_common.py     # 预训练的数据集与数据/模型参数（原版与 Megatron 后端共用）
 │   ├── trainer.py             # 通用训练循环：warmup / 续训 / DDP / FSDP2 / 激活重计算
 │   ├── benchmarks.py          # 标准评测：ARC / MMLU / C-Eval / HellaSwag / GSM8K / 本地 jsonl
 │   ├── trainer_utils.py       # LR schedule / 分布式初始化 / 日志 / 权重 IO（严格校验）
-│   └── mcore/                 # Megatron-core 版：model.py（TP/SP/EP/PP 组件实现的 RDT，GQA/MLA）、convert.py（权重互转 / TP·EP·PP 切分）、compat.py
+│   └── mcore/                 # Megatron-core 后端：model.py（TP/SP/EP/PP 组件实现的 RDT，GQA/MLA）、train.py（训练循环）、args.py（专用参数）、convert.py（权重互转 / 切分）、compat.py
 ├── scripts/
 │   ├── prepare_allenai.py     # AllenAI 预训练 / SFT / 偏好数据流式下载、混合、过滤、配额控制
 │   ├── train_tokenizer.py     # BPE 分词器训练
