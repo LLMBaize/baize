@@ -479,12 +479,12 @@ wandb sync out/wandb/offline-run-*
 
 ## Megatron-core 版训练
 
-`scripts/pretrain_mcore.py` 用 Megatron-core 重写了预训练，支持**张量并行**（自动开启序列并行）、**专家并行**（`--expert_parallel_size`）、**流水线并行**（`--pipeline_parallel_size`，2 段）、**MLA 注意力**（`--attn_type mla`）、Megatron DDP 和分布式优化器。
+预训练只有一个入口 `scripts/pretrain.py`，用 `--backend` 选择训练后端：`native`（默认，原版循环）或 `megatron`（Megatron-core）。Megatron 后端支持**张量并行**（自动开启序列并行）、**专家并行**（`--expert_parallel_size`）、**流水线并行**（`--pipeline_parallel_size`，2 段）、**MLA 注意力**（`--attn_type mla`）、Megatron DDP 和分布式优化器。
 模型结构、数据、超参与原版完全一致，训练结束导出原版格式的 `pretrain.safetensors`，`eval.py`、`demo.py`、`sft.py` 可以直接使用。
 
 ```bash
 pip install "megatron-core==0.16.1"
-torchrun --nproc_per_node 8 scripts/pretrain_mcore.py --data data/pretrain.bin ...模型参数同 pretrain.py... \
+torchrun --nproc_per_node 8 scripts/pretrain.py --backend megatron --data data/pretrain.bin ...模型参数同原版... \
     --tensor_parallel_size 2 --use_distributed_optimizer 1 --bf16 1
 ```
 
@@ -663,8 +663,7 @@ BaiZe/
 │   ├── prepare_allenai.py     # AllenAI 预训练 / SFT / 偏好数据流式下载、混合、过滤、配额控制
 │   ├── train_tokenizer.py     # BPE 分词器训练
 │   ├── tokenize_corpus.py     # 预分词 → memmap .bin（大语料训练用）
-│   ├── pretrain.py            # 预训练
-│   ├── pretrain_mcore.py      # 预训练（Megatron-core：TP / EP / PP / MLA / Megatron DDP / 分布式优化器）
+│   ├── pretrain.py            # 预训练统一入口（--backend native | megatron）
 │   ├── sft.py                 # 指令微调（prompt mask / 多轮对话）
 │   ├── dpo.py                 # 偏好对齐（DPO）
 │   ├── eval.py                # 困惑度 / 对话 / 标准评测（支持 --loops 深度外推）

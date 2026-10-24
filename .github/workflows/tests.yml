@@ -26,7 +26,7 @@ jobs:
           done
 
   megatron-core:
-    # Megatron-core 版（scripts/pretrain_mcore.py）的 CPU 冒烟测试：模型等价、TP=2/DP=2、续训、权重导出
+    # Megatron-core 后端（scripts/pretrain.py --backend megatron）的 CPU 冒烟测试：模型等价、TP=2/DP=2、续训、权重导出
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

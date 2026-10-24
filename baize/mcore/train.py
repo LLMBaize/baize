@@ -1,100 +1,41 @@
-#!/usr/bin/env python3
-"""
-BaiZe 预训练 —— Megatron-core 版
-================================
+"""Megatron-core 训练循环（--backend megatron 时由 scripts/pretrain.py 调用）。
 
-与 scripts/pretrain.py 同样的数据、模型参数和训练语义（warmup+余弦、梯度累积、ACT 延后启用、
+与原版循环（baize/trainer.py）相同的数据、模型参数和训练语义（warmup+余弦、梯度累积、ACT 延后启用、
 ponder cost、可续训），训练循环换成 Megatron-core：
 
-    并行      parallel_state（张量并行 TP × 数据并行 DP），torchrun 启动
+    并行      parallel_state（TP × PP × DP，EP 位于 DP 组内），torchrun 启动
     模型      baize/mcore/model.py（TransformerBlock / SelfAttention / MoELayer / VocabParallel*）
     DDP       megatron.core.distributed.DistributedDataParallel（梯度 bucket，可选分布式优化器）
     优化器    megatron.core.optimizer.get_megatron_optimizer（AdamW，梯度裁剪，bf16 主权重）
     学习率    与原版完全一致的线性 warmup + 余弦退火（baize.trainer_utils.get_lr，逐步写入 param_groups）
     前向反向  megatron.core.pipeline_parallel.get_forward_backward_func（micro-batch 梯度累积）
 
-用法：
-    # 单卡
-    python scripts/pretrain_mcore.py --data data/pretrain.bin --hidden_size 1024 ...
-    # 8 卡：TP=2 × DP=4，分布式优化器
-    torchrun --nproc_per_node=8 scripts/pretrain_mcore.py --data data/pretrain.bin \\
-        --tensor_parallel_size 2 --use_distributed_optimizer 1 --bf16 1 ...
-    # 无 GPU 冒烟测试（CPU + gloo）
-    python scripts/pretrain_mcore.py --data data/corpus.txt --cpu_smoke 1 --max_steps 10 ...
-
 产物：
-    <save_dir>/mcore_ckpt_<save_weight>/step_XXXXXXX/tpXX_epXX_ppXX.pt   断点（每个 (TP, EP, PP) 坐标一份，--from_resume 1 续训）
+    <save_dir>/mcore_ckpt_<save_weight>/step_XXXXXXX/tpXX_epXX_ppXX.pt   断点（--from_resume 1 续训）
     <save_dir>/<save_weight>.safetensors + config.json       训练结束导出的原版格式权重，
                                                              可直接用于 eval.py / demo.py / sft.py
 """
 
-import argparse
 import functools
 import json
 import os
 import shutil
-import sys
 import time
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from baize import BaiZeTokenizer  # noqa: E402
-from baize.data import ResumableSampler  # noqa: E402
-from baize.mcore import build_model, cpu_smoke_mode, init_parallel  # noqa: E402
-from baize.mcore.convert import (  # noqa: E402
+from baize import BaiZeTokenizer
+from baize.data import ResumableSampler
+from baize.mcore import build_model, cpu_smoke_mode, init_parallel
+from baize.mcore.args import check_parallel_args
+from baize.mcore.convert import (
     hf_to_mcore, mcore_to_hf, merge_parallel, merge_pp, model_tensors, shard_parallel, split_pp,
 )
-from baize.trainer import WandbLogger  # noqa: E402
-from baize.trainer_utils import Logger, get_lr, is_main_process, resolve_warmup, save_weights  # noqa: E402
-from pretrain import add_data_model_args, build_dataset, config_from_args  # noqa: E402
-
-
-def add_mcore_train_args(parser):
-    g = parser.add_argument_group("训练（Megatron-core）")
-    g.add_argument("--save_dir", type=str, default="out")
-    g.add_argument("--epochs", type=int, default=1)
-    g.add_argument("--max_steps", type=int, default=None, help="最多训练多少个优化步（与 epochs 取较小者）")
-    g.add_argument("--batch_size", type=int, default=8, help="每个 DP rank 的 micro-batch 大小")
-    g.add_argument("--accumulation_steps", type=int, default=1, help="每步的 micro-batch 数（梯度累积）")
-    g.add_argument("--learning_rate", type=float, default=5e-4)
-    g.add_argument("--warmup_steps", type=int, default=None, help="默认总步数的 1%%")
-    g.add_argument("--weight_decay", type=float, default=0.1, help="norm / bias / 1 维参数自动不做 decay")
-    g.add_argument("--grad_clip", type=float, default=1.0)
-    g.add_argument("--bf16", type=int, default=1, choices=[0, 1], help="bf16 训练（fp32 主权重）；CPU 冒烟时强制关闭")
-    g.add_argument("--tensor_parallel_size", type=int, default=1)
-    g.add_argument("--expert_parallel_size", type=int, default=1, help="专家并行度（MoE 层的专家切分到 EP 个 rank）")
-    g.add_argument("--pipeline_parallel_size", type=int, default=1,
-                   help="流水线并行段数：1 或 2（第一段 = 词嵌入+Prelude，第二段 = 循环块+Coda+输出层）")
-    g.add_argument("--moe_dispatcher", type=str, default="allgather", choices=["allgather", "alltoall"],
-                   help="MoE token 分发方式；alltoall 通信更省，但 CPU 冒烟测试下未通过（见 docs/megatron_core.md）")
-    g.add_argument("--use_distributed_optimizer", type=int, default=0, choices=[0, 1],
-                   help="优化器状态在 DP 组内切分（ZeRO-1），省显存")
-    g.add_argument("--grad_checkpoint", type=int, default=0, choices=[0, 1], help="激活重计算")
-    g.add_argument("--act_start_step", type=int, default=None, help="前 N 步关闭 ACT；默认总步数的 10%%")
-    g.add_argument("--log_interval", type=int, default=20)
-    g.add_argument("--save_interval", type=int, default=500, help="断点间隔（只保留最新一份）")
-    g.add_argument("--from_resume", type=int, default=0, choices=[0, 1])
-    g.add_argument("--exit_interval", type=int, default=None,
-                   help="训练到该步数的整数倍时存断点并退出（同 Megatron-LM --exit-interval；用于分段调度 / 测试续训）")
-    g.add_argument("--num_workers", type=int, default=0)
-    g.add_argument("--seed", type=int, default=42)
-    g.add_argument("--cpu_smoke", type=int, default=0, choices=[0, 1], help="无 GPU 冒烟测试：CPU + gloo")
-    w = parser.add_argument_group("Weights & Biases")
-    w.add_argument("--use_wandb", type=int, default=0, choices=[0, 1])
-    w.add_argument("--wandb_project", type=str, default="baize")
-    w.add_argument("--wandb_entity", type=str, default=None)
-    w.add_argument("--wandb_run_name", type=str, default=None)
-    w.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
-
-
-# ---------------------------------------------------------------------------
-# 断点：每个 (TP, EP, PP) 坐标一份文件（每个坐标只由一个 rank 写），按步数分目录，latest.json 指向最新完整断点
-# ---------------------------------------------------------------------------
+from baize.pretrain_common import build_dataset, config_from_args
+from baize.trainer import WandbLogger
+from baize.trainer_utils import Logger, get_lr, is_main_process, resolve_warmup, save_weights
 
 
 def _ckpt_root(args):
@@ -221,28 +162,15 @@ def export_hf(args, cfg, module):
 # ---------------------------------------------------------------------------
 
 
-def _check_parallel_args(args, cfg_n_experts):
-    """并行方式的合法性检查（在初始化进程组之前给出明确报错）。"""
-    tp, pp, ep = args.tensor_parallel_size, args.pipeline_parallel_size, args.expert_parallel_size
-    world = int(os.environ.get("WORLD_SIZE", 1))
-    if pp not in (1, 2):
-        raise ValueError("--pipeline_parallel_size 只能是 1 或 2：循环块与 Coda 必须在同一段内完整跑完所有圈")
-    if args.num_key_value_heads % tp:
-        raise ValueError(f"--tensor_parallel_size {tp} 必须能整除 num_key_value_heads={args.num_key_value_heads}")
-    if ep > 1 and cfg_n_experts % ep:
-        raise ValueError(f"--expert_parallel_size {ep} 必须能整除 n_experts={cfg_n_experts}")
-    if world % (tp * pp * ep):
-        raise ValueError(f"WORLD_SIZE={world} 必须能被 tp×pp×ep={tp * pp * ep} 整除（余下的为数据并行）")
+# ---------------------------------------------------------------------------
+# 训练
+# ---------------------------------------------------------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser(description="BaiZe Pretrain (Megatron-core)")
-    add_data_model_args(parser)
-    add_mcore_train_args(parser)
-    args = parser.parse_args()
+def run_megatron(args):
     if args.cpu_smoke:
         args.bf16 = 0
-    _check_parallel_args(args, args.n_experts)
+    check_parallel_args(args)
 
     init_parallel(args.tensor_parallel_size, args.expert_parallel_size, args.pipeline_parallel_size,
                   seed=args.seed, cpu=bool(args.cpu_smoke))
@@ -399,7 +327,3 @@ def main():
     tracker.finish()
     dist.barrier()
     dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()

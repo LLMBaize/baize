@@ -5,7 +5,7 @@ BaiZe 的 Megatron-core 版本（可选依赖：pip install megatron-core）。
     init_parallel(tensor_parallel_size=2)
     model = build_model(BaiZeConfig(...), tensor_parallel_size=2)
 
-训练入口：scripts/pretrain_mcore.py；权重互转：baize/mcore/convert.py。
+训练入口：scripts/pretrain.py --backend megatron（循环在 baize/mcore/train.py）；权重互转：baize/mcore/convert.py。
 """
 
 import os

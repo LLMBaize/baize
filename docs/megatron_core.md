@@ -1,6 +1,6 @@
 # Megatron-core 版训练
 
-`scripts/pretrain_mcore.py` 用 [Megatron-core](https://github.com/NVIDIA/Megatron-LM)（`megatron-core`）重写了 BaiZe 的预训练。
+预训练只有一个入口 `scripts/pretrain.py`。加 `--backend megatron` 即使用 [Megatron-core](https://github.com/NVIDIA/Megatron-LM)（`megatron-core`）训练循环；不加则是原版循环（`--backend native`，默认）。
 模型结构、数据、超参语义都和原版 `scripts/pretrain.py` 完全一致。训练结束后导出的权重是原版格式，
 `eval.py`、`demo.py`、`sft.py` 可以直接使用。
 
@@ -23,30 +23,30 @@ pip install "megatron-core==0.16.1"
 
 ```bash
 # 单卡
-python scripts/pretrain_mcore.py --data data/pretrain.bin --tokenizer tokenizer --save_dir out \
+python scripts/pretrain.py --backend megatron --data data/pretrain.bin --tokenizer tokenizer --save_dir out \
     --hidden_size 1024 --num_attention_heads 16 --num_key_value_heads 4 --head_dim 64 \
     --intermediate_size 2816 --prelude_layers 4 --coda_layers 4 \
     --max_loop_iters 8 --n_loops_train 4 --moe_intermediate_size 704 \
     --max_seq_len 512 --batch_size 32 --accumulation_steps 16 --learning_rate 6e-4 --bf16 1
 
 # 8 卡：张量并行 2 × 数据并行 4，分布式优化器
-torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... \
+torchrun --nproc_per_node 8 scripts/pretrain.py --backend megatron ...同上... \
     --tensor_parallel_size 2 --use_distributed_optimizer 1
 
 # 8 卡：专家并行 4 × 数据并行 2（MoE 专家切到 4 个 rank 上）
-torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... --expert_parallel_size 4
+torchrun --nproc_per_node 8 scripts/pretrain.py --backend megatron ...同上... --expert_parallel_size 4
 
 # 4 卡：流水线并行 2 × 数据并行 2（第一段：词嵌入 + Prelude；第二段：循环块 + Coda + 输出层）
-torchrun --nproc_per_node 4 scripts/pretrain_mcore.py ...同上... --pipeline_parallel_size 2
+torchrun --nproc_per_node 4 scripts/pretrain.py --backend megatron ...同上... --pipeline_parallel_size 2
 
 # MLA 注意力（与原版 pretrain.py 的 --attn_type mla 相同），可与上述并行方式任意组合
-torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... --attn_type mla --expert_parallel_size 4
+torchrun --nproc_per_node 8 scripts/pretrain.py --backend megatron ...同上... --attn_type mla --expert_parallel_size 4
 
 # 中断后续训（原命令加 --from_resume 1）
-torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... --from_resume 1
+torchrun --nproc_per_node 8 scripts/pretrain.py --backend megatron ...同上... --from_resume 1
 
 # 从原版权重初始化（读取 <save_dir>/<from_weight>.safetensors，按 PP / TP / EP 自动切分）
-python scripts/pretrain_mcore.py ... --from_weight pretrain
+python scripts/pretrain.py --backend megatron ... --from_weight pretrain
 ```
 
 ### 并行方式与 batch：TP、PP、EP、DP 怎么配
@@ -94,7 +94,7 @@ samples / step = batch_size × accumulation_steps × DP
 
 **启动前的检查**：`pipeline_parallel_size` 只能是 1 或 2；`tensor_parallel_size` 要整除 `num_key_value_heads`；`expert_parallel_size` 要整除 `n_experts`；`WORLD_SIZE` 要能被 `TP × PP × EP` 整除。不满足时会直接报错。
 
-数据参数和模型参数与 `pretrain.py` 完全相同（两个脚本共用 `add_data_model_args`）。Megatron-core 版特有的参数如下：
+数据参数、模型参数和训练参数与原版完全相同（都定义在 `baize/pretrain_common.py` 与 `baize/trainer.py`），两个后端共用同一组默认值（例如 `--epochs` 默认 2、`--save_interval` 默认 200）。下表是只对 `--backend megatron` 生效的参数，原版后端会忽略它们：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -131,7 +131,7 @@ out/pretrain.safetensors + out/config.json       # 训练结束导出的原版�
 
 ## 实现对照
 
-| 原版（`baize/model.py`、`baize/trainer.py`） | Megatron-core 版（`baize/mcore/`、`scripts/pretrain_mcore.py`） |
+| 原版（`baize/model.py`、`baize/trainer.py`） | Megatron-core 版（`baize/mcore/`，循环在 `baize/mcore/train.py`，入口 `scripts/pretrain.py --backend megatron`） |
 |---|---|
 | `nn.Embedding` / `lm_head`（共享权重） | `LanguageModelEmbedding`（`VocabParallelEmbedding`）/ `ColumnParallelLinear`，共享权重；词表 padding 到 128×TP 的倍数，padding 列在 loss 前置为 −inf |
 | 交叉熵 | `tensor_parallel.vocab_parallel_cross_entropy`（词表切分也能算） |

@@ -82,11 +82,11 @@ def _original_losses(d, arch=ARCH):
 
 def _mcore(d, *extra, nproc=1, arch=ARCH):
     if nproc == 1:
-        cmd = [sys.executable, "scripts/pretrain_mcore.py"]
+        cmd = [sys.executable, "scripts/pretrain.py", "--backend", "megatron"]
         env = {"MASTER_PORT": _free_port()}
     else:
         cmd = [sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={nproc}",
-               f"--master_port={_free_port()}", "scripts/pretrain_mcore.py"]
+               f"--master_port={_free_port()}", "scripts/pretrain.py", "--backend", "megatron"]
         env = {}
     return _run([*cmd, *_common(arch), "--save_dir", d, "--cpu_smoke", "1", *extra], env)
 
