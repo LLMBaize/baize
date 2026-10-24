@@ -45,7 +45,7 @@ torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... --attn_type m
 # 中断后续训（原命令加 --from_resume 1）
 torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... --from_resume 1
 
-# 从原版权重继续训练（自动按 TP 切分）
+# 从原版权重初始化（读取 <save_dir>/<from_weight>.safetensors，按 PP / TP / EP 自动切分）
 python scripts/pretrain_mcore.py ... --from_weight pretrain
 ```
 
@@ -55,7 +55,7 @@ python scripts/pretrain_mcore.py ... --from_weight pretrain
 |---|---|---|
 | `--tensor_parallel_size` | 1 | 张量并行度。>1 时自动开启**序列并行**（Megatron 要求 MoE + TP 必须开）；要求能整除 `num_key_value_heads` |
 | `--expert_parallel_size` | 1 | 专家并行度。每个 EP rank 持有 `n_experts / EP` 个专家（要求整除）；dense 部分仍在 DP 组内复制 |
-| `--pipeline_parallel_size` | 1 | 流水线并行度，**只支持 1 或 2**。两段：词嵌入 + Prelude | 循环块 + Coda + 输出层；循环块的全部圈数都在同一段内完成。词嵌入与输出层权重在两段之间绑定并同步梯度 |
+| `--pipeline_parallel_size` | 1 | 流水线并行度，**只支持 1 或 2**。两段：第一段为词嵌入 + Prelude，第二段为循环块 + Coda + 输出层；循环块的全部圈数都在同一段内完成。词嵌入与输出层权重在两段之间绑定并同步梯度 |
 | `--moe_dispatcher` | allgather | MoE token 分发方式：`allgather`（CPU 冒烟可测）或 `alltoall`（EP 通信更省；仅 GPU 上可用，CPU 冒烟未测） |
 | `--attn_type` | gqa | `gqa` 或 `mla`（与原版相同）。MLA 的 `kv_lora_rank` / `q_lora_rank` / `qk_*_head_dim` / `v_head_dim` 使用 `BaiZeConfig` 的默认值 |
 | `--use_distributed_optimizer` | 0 | 优化器状态在 DP 组内切分（ZeRO-1） |
