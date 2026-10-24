@@ -49,6 +49,51 @@ torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... --from_resume
 python scripts/pretrain_mcore.py ... --from_weight pretrain
 ```
 
+### 并行方式与 batch：TP、PP、EP、DP 怎么配
+
+进程数（`torchrun --nproc_per_node` 乘节点数，即 `WORLD_SIZE`）按下面的方式分配：
+
+```
+WORLD_SIZE = TP × PP × DP
+DP         = WORLD_SIZE / (TP × PP)          # 数据并行度（脚本里打印的 dp_size）
+```
+
+- **TP**（`--tensor_parallel_size`）：每层的权重切到 TP 个 rank 上，要求 `TP | num_key_value_heads`。
+- **PP**（`--pipeline_parallel_size`）：模型切成 PP 段（只支持 1 或 2）。第一段是词嵌入 + Prelude，第二段是循环块 + Coda + 输出层。PP 段之间没有权重切分，只传激活。同一个 DP 副本的 PP 段组成一条流水线，DP 副本之间互相独立。
+- **EP**（`--expert_parallel_size`）：**不增加进程数**。EP rank 位于 DP 组内部：dense 参数在 EP rank 之间复制，MoE 专家切到 EP 个 rank 上（每个 rank 持有 `n_experts / EP` 个）。要求 `EP | DP` 且 `EP | n_experts`。
+- **DP**：由上面的公式算出，不用单独指定。每个 DP 副本读取不同的数据。
+
+**每个优化步的样本数**：
+
+```
+samples / step = batch_size × accumulation_steps × DP
+```
+
+- `--batch_size` 是每个 DP 副本的 micro-batch 大小。
+- `--accumulation_steps` 在 PP 下就是流水线的 micro-batch 数。PP=2 时建议至少设为 2，否则第二段会长时间空等（流水线气泡）。
+- 切换并行方式时，想要和另一个配置得到**同样的训练轨迹**，就保持 `batch_size × accumulation_steps × DP` 不变。例如（已在测试中验证）：
+
+| 运行方式 | 命令关键参数 | DP | 每步样本 |
+|---|---|---|---|
+| 2 卡，DP=2 | `--batch_size 2 --accumulation_steps 2` | 2 | 8 |
+| 2 卡，EP=2（DP=2） | `--batch_size 2 --accumulation_steps 2 --expert_parallel_size 2` | 2 | 8 |
+| 2 卡，PP=2（DP=1） | `--batch_size 4 --accumulation_steps 2 --pipeline_parallel_size 2` | 1 | 8 |
+| 2 卡，TP=2（DP=1） | `--batch_size 4 --accumulation_steps 2 --tensor_parallel_size 2` | 1 | 8 |
+
+**常见组合（以 8 卡为例）**：
+
+| 目标 | 命令关键参数 | WORLD_SIZE 分解 | DP |
+|---|---|---|---|
+| 纯数据并行 | （无） | 1 × 1 × 8 | 8 |
+| TP=2 + DP | `--tensor_parallel_size 2` | 2 × 1 × 4 | 4 |
+| PP=2 + DP | `--pipeline_parallel_size 2` | 1 × 2 × 4 | 4 |
+| TP=2 + PP=2 + DP | `--tensor_parallel_size 2 --pipeline_parallel_size 2` | 2 × 2 × 2 | 2 |
+| EP=4 + DP | `--expert_parallel_size 4` | 1 × 1 × 8（专家 4 路切分，expert-DP = 2） | 8 |
+
+**断点与续训**：断点按 `(TP, EP, PP)` 坐标保存，`latest.json` 记录了这三者。续训时它们必须与保存时相同，否则启动会报错。DP 大小改变时，数据切分会随之改变，因此续训结果与不中断的运行可能不一致（这一点尚未测试）。
+
+**启动前的检查**：`pipeline_parallel_size` 只能是 1 或 2；`tensor_parallel_size` 要整除 `num_key_value_heads`；`expert_parallel_size` 要整除 `n_experts`；`WORLD_SIZE` 要能被 `TP × PP × EP` 整除。不满足时会直接报错。
+
 数据参数和模型参数与 `pretrain.py` 完全相同（两个脚本共用 `add_data_model_args`）。Megatron-core 版特有的参数如下：
 
 | 参数 | 默认 | 说明 |
