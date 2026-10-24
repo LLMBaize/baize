@@ -23,7 +23,7 @@ ponder cost、可续训），训练循环换成 Megatron-core：
     python scripts/pretrain_mcore.py --data data/corpus.txt --cpu_smoke 1 --max_steps 10 ...
 
 产物：
-    <save_dir>/mcore_ckpt_<save_weight>/step_XXXXXXX/tpXX.pt   断点（每个 TP 分片一份，--from_resume 1 续训）
+    <save_dir>/mcore_ckpt_<save_weight>/step_XXXXXXX/tpXX_epXX_ppXX.pt   断点（每个 (TP, EP, PP) 坐标一份，--from_resume 1 续训）
     <save_dir>/<save_weight>.safetensors + config.json       训练结束导出的原版格式权重，
                                                              可直接用于 eval.py / demo.py / sft.py
 """
@@ -93,7 +93,7 @@ def add_mcore_train_args(parser):
 
 
 # ---------------------------------------------------------------------------
-# 断点：每个 TP 分片一份文件（只由 DP rank 0 写），按步数分目录，latest.json 指向最新完整断点
+# 断点：每个 (TP, EP, PP) 坐标一份文件（每个坐标只由一个 rank 写），按步数分目录，latest.json 指向最新完整断点
 # ---------------------------------------------------------------------------
 
 

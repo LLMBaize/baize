@@ -19,8 +19,8 @@ LTI / LoRA / ACT / 圈数嵌入  直接复用原版模块（参数在张量并�
 =========================  ==============================================================
 
 张量布局沿用 Megatron 约定：隐状态为 [s, b, h]。
-支持：张量并行（TP，自动开启序列并行）、数据并行（DP，Megatron DDP / 分布式优化器）。
-不支持：流水线并行（循环块要在同一 stage 内迭代）、MLA（attn_type="mla"）。
+支持：张量并行（TP，自动开启序列并行）、专家并行（EP）、两段流水线并行（PP=2，循环块在同一段内迭代）、
+MLA（attn_type="mla"）、数据并行（DP，Megatron DDP / 分布式优化器）。
 """
 
 import dataclasses
@@ -77,7 +77,6 @@ def build_transformer_configs(cfg, *, tensor_parallel_size=1, expert_parallel_si
         num_attention_heads=cfg.num_attention_heads,
         num_query_groups=cfg.num_key_value_heads or cfg.num_attention_heads,
         # GQA 用 QK-norm；MLA 的 q/kv 归一化作用在压缩隐变量上（见 _layer_spec）
-        
         kv_channels=cfg.head_dim,
         ffn_hidden_size=cfg.intermediate_size,
         normalization="RMSNorm",
