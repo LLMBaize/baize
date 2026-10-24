@@ -16,10 +16,15 @@ sys.path.insert(0, ROOT)
 from baize import BaiZeConfig, BaiZeForCausalLM  # noqa: E402
 
 
-def tiny_config(**kw):
+MLA_DIMS = dict(kv_lora_rank=16, q_lora_rank=24, qk_rope_head_dim=8, qk_nope_head_dim=8, v_head_dim=8)
+
+
+def tiny_config(attn="gqa", **kw):
     base = dict(vocab_size=100, hidden_size=32, num_attention_heads=4, num_key_value_heads=2, head_dim=8,
                 intermediate_size=64, moe_intermediate_size=16, n_experts=4, n_experts_per_tok=2,
-                prelude_layers=2, coda_layers=1, max_loop_iters=4, max_position_embeddings=64)
+                prelude_layers=2, coda_layers=1, max_loop_iters=4, max_position_embeddings=64, attn_type=attn)
+    if attn == "mla":
+        base.update(MLA_DIMS)
     base.update(kw)
     return BaiZeConfig(**base)
 
@@ -33,8 +38,10 @@ def equivalence():
 
     MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1))
     # 跑满所有圈（含 MoE aux-loss）/ ACT 提前停机（提前退出循环时 aux 的均摊方式与原版不同，见 README，这里关掉 aux）
-    for use_moe, bias, aux in [(True, -3.0, 1e-3), (False, 3.0, 0.0), (True, 3.0, 0.0)]:
-        cfg = tiny_config(use_moe=use_moe, act_init_bias=bias, router_aux_loss_coef=aux)
+    cases = [("gqa", True, -3.0, 1e-3), ("gqa", False, 3.0, 0.0), ("gqa", True, 3.0, 0.0),
+             ("mla", True, -3.0, 1e-3), ("mla", False, 3.0, 0.0)]
+    for attn, use_moe, bias, aux in cases:
+        cfg = tiny_config(attn=attn, use_moe=use_moe, act_init_bias=bias, router_aux_loss_coef=aux)
         torch.manual_seed(0)
         hf = BaiZeForCausalLM(cfg)
         with torch.no_grad():
@@ -49,7 +56,7 @@ def equivalence():
         with torch.no_grad():
             for loops in (1, 4):
                 diff = (hf(x, n_loops=loops).logits - mc(x, n_loops=loops)).abs().max().item()
-                assert diff < 1e-5, f"logits 不一致 moe={use_moe} loops={loops}: {diff}"
+                assert diff < 1e-5, f"logits 不一致 attn={attn} moe={use_moe} loops={loops}: {diff}"
                 assert hf.model.recurrent.avg_loops.item() == mc.recurrent.avg_loops.item()
 
         # 训练模式下的 loss 与梯度
@@ -76,8 +83,8 @@ def equivalence():
 def tp_convert():
     from baize.mcore.convert import hf_to_mcore, merge_tp, shard_tp
 
-    for use_moe in (False, True):
-        cfg = tiny_config(use_moe=use_moe)
+    for attn, use_moe in (("gqa", False), ("gqa", True), ("mla", True)):
+        cfg = tiny_config(attn=attn, use_moe=use_moe)
         torch.manual_seed(0)
         full = hf_to_mcore(BaiZeForCausalLM(cfg).state_dict(), cfg, vocab_padded=256)
         shards = [shard_tp(full, cfg, r, 2) for r in range(2)]

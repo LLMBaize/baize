@@ -46,7 +46,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from baize import BaiZeTokenizer  # noqa: E402
 from baize.data import ResumableSampler  # noqa: E402
 from baize.mcore import build_model, cpu_smoke_mode, init_parallel  # noqa: E402
-from baize.mcore.convert import hf_to_mcore, mcore_to_hf, merge_tp, model_tensors, shard_tp  # noqa: E402
+from baize.mcore.convert import (  # noqa: E402
+    hf_to_mcore, mcore_to_hf, merge_parallel, merge_pp, model_tensors, shard_parallel, split_pp,
+)
 from baize.trainer import WandbLogger  # noqa: E402
 from baize.trainer_utils import Logger, get_lr, is_main_process, resolve_warmup, save_weights  # noqa: E402
 from pretrain import add_data_model_args, build_dataset, config_from_args  # noqa: E402
@@ -65,6 +67,11 @@ def add_mcore_train_args(parser):
     g.add_argument("--grad_clip", type=float, default=1.0)
     g.add_argument("--bf16", type=int, default=1, choices=[0, 1], help="bf16 训练（fp32 主权重）；CPU 冒烟时强制关闭")
     g.add_argument("--tensor_parallel_size", type=int, default=1)
+    g.add_argument("--expert_parallel_size", type=int, default=1, help="专家并行度（MoE 层的专家切分到 EP 个 rank）")
+    g.add_argument("--pipeline_parallel_size", type=int, default=1,
+                   help="流水线并行段数：1 或 2（第一段 = 词嵌入+Prelude，第二段 = 循环块+Coda+输出层）")
+    g.add_argument("--moe_dispatcher", type=str, default="allgather", choices=["allgather", "alltoall"],
+                   help="MoE token 分发方式；alltoall 通信更省，但 CPU 冒烟测试下未通过（见 docs/megatron_core.md）")
     g.add_argument("--use_distributed_optimizer", type=int, default=0, choices=[0, 1],
                    help="优化器状态在 DP 组内切分（ZeRO-1），省显存")
     g.add_argument("--grad_checkpoint", type=int, default=0, choices=[0, 1], help="激活重计算")
@@ -94,28 +101,43 @@ def _ckpt_root(args):
     return os.path.join(args.save_dir, f"mcore_ckpt_{args.save_weight}")
 
 
-def save_checkpoint(args, step, model, optimizer, wandb_id):
+def _rank_tag():
+    """本 rank 在 (TP, EP, PP) 网格中的坐标，用作断点文件名。"""
     from megatron.core import parallel_state as ps
 
+    return (f"tp{ps.get_tensor_model_parallel_rank():02d}_ep{ps.get_expert_model_parallel_rank():02d}"
+            f"_pp{ps.get_pipeline_model_parallel_rank():02d}")
+
+
+def _is_saver():
+    """每个 (TP, EP, PP) 坐标只让一个 rank 写文件。专家参数只在 expert-DP 组内复制，所以用 expert-DP rank 0；
+    dense DP 组包含 EP 维度，用它会漏掉 ep>0 的分片。"""
+    from megatron.core import parallel_state as ps
+
+    return ps.get_expert_data_parallel_rank() == 0
+
+
+def save_checkpoint(args, step, model, optimizer, wandb_id):
     root = _ckpt_root(args)
     d = os.path.join(root, f"step_{step:07d}")
-    tp_rank, dp_rank = ps.get_tensor_model_parallel_rank(), ps.get_data_parallel_rank()
+    tag = _rank_tag()
     if is_main_process():
         os.makedirs(d, exist_ok=True)
     dist.barrier()
     if args.use_distributed_optimizer:  # 集合通信：参数状态汇总到 DP rank 0
-        optimizer.save_parameter_state(os.path.join(d, f"tp{tp_rank:02d}_distopt.pt"))
-    if dp_rank == 0:
+        optimizer.save_parameter_state(os.path.join(d, f"{tag}_distopt.pt"))
+    if _is_saver():
         state = {"model": model_tensors(model.module), "optimizer": optimizer.state_dict(),
                  "step": step, "wandb_id": wandb_id}
-        tmp = os.path.join(d, f"tp{tp_rank:02d}.pt.tmp")
+        tmp = os.path.join(d, f"{tag}.pt.tmp")
         torch.save(state, tmp)
-        os.replace(tmp, os.path.join(d, f"tp{tp_rank:02d}.pt"))
+        os.replace(tmp, os.path.join(d, f"{tag}.pt"))
     dist.barrier()
     if is_main_process():
         tmp = os.path.join(root, "latest.json.tmp")
         with open(tmp, "w") as f:
-            json.dump({"step": step, "dir": os.path.basename(d), "tp": args.tensor_parallel_size}, f)
+            json.dump({"step": step, "dir": os.path.basename(d), "tp": args.tensor_parallel_size,
+                       "ep": args.expert_parallel_size, "pp": args.pipeline_parallel_size}, f)
         os.replace(tmp, os.path.join(root, "latest.json"))
         for old in os.listdir(root):  # 新断点落盘后再删旧的
             if old.startswith("step_") and old != os.path.basename(d):
@@ -132,15 +154,16 @@ def load_checkpoint(args, model, optimizer):
         Logger(f"[warning] 未找到断点 {latest}，从头训练")
         return 0, None
     meta = json.load(open(latest))
-    if meta["tp"] != args.tensor_parallel_size:
-        raise ValueError(f"断点的 TP={meta['tp']} 与当前 --tensor_parallel_size={args.tensor_parallel_size} 不同")
+    want = {"tp": args.tensor_parallel_size, "ep": args.expert_parallel_size, "pp": args.pipeline_parallel_size}
+    if {k: meta.get(k, 1) for k in want} != want:
+        raise ValueError(f"断点的并行方式 {({k: meta.get(k, 1) for k in want})} 与当前参数 {want} 不同")
     d = os.path.join(_ckpt_root(args), meta["dir"])
-    tp_rank = ps.get_tensor_model_parallel_rank()
-    state = torch.load(os.path.join(d, f"tp{tp_rank:02d}.pt"), map_location="cpu", weights_only=False)
+    tag = _rank_tag()
+    state = torch.load(os.path.join(d, f"{tag}.pt"), map_location="cpu", weights_only=False)
     _load_model_tensors(model.module, state["model"])
     optimizer.load_state_dict(state["optimizer"])
     if args.use_distributed_optimizer:  # 与 Megatron-LM 相同的顺序：先 state_dict，再参数状态
-        optimizer.load_parameter_state(os.path.join(d, f"tp{tp_rank:02d}_distopt.pt"))
+        optimizer.load_parameter_state(os.path.join(d, f"{tag}_distopt.pt"))
     # 注意不要调用 optimizer.reload_model_params()：bf16 时它会用 bf16 模型参数覆盖刚恢复的 fp32 主权重
     Logger(f"断点续训: {d} step={state['step']}")
     return state["step"], state.get("wandb_id")
@@ -154,35 +177,64 @@ def _load_model_tensors(module, sd):
 
 
 def load_hf_weights(args, cfg, module):
-    """从原版 safetensors 初始化（例如继续训练原版预训练权重），按 TP 切分后加载。"""
+    """从原版 safetensors 初始化（例如继续训练原版预训练权重），按 PP / TP / EP 切分后加载。"""
     from megatron.core import parallel_state as ps
     from safetensors.torch import load_file
 
     path = os.path.join(args.save_dir, f"{args.from_weight}.safetensors")
     full = hf_to_mcore(load_file(path), cfg, vocab_padded=module.vocab_padded)
-    _load_model_tensors(module, shard_tp(full, cfg, ps.get_tensor_model_parallel_rank(),
-                                         args.tensor_parallel_size))
-    Logger(f"从 {path} 加载原版权重并切分为 TP={args.tensor_parallel_size}")
+    piece = split_pp(full, cfg, ps.get_pipeline_model_parallel_rank(), args.pipeline_parallel_size)
+    piece = shard_parallel(piece, cfg, ps.get_tensor_model_parallel_rank(), args.tensor_parallel_size,
+                           ps.get_expert_model_parallel_rank(), args.expert_parallel_size)
+    _load_model_tensors(module, piece)
+    Logger(f"从 {path} 加载原版权重并切分为 PP={args.pipeline_parallel_size} TP={args.tensor_parallel_size} "
+           f"EP={args.expert_parallel_size}")
 
 
 def export_hf(args, cfg, module):
-    """汇总所有 TP 分片 → 原版格式 safetensors + config.json（rank 0 写）。"""
+    """收集所有 (PP, TP, EP) 分片 → 原版格式 safetensors + config.json（rank 0 写）。"""
     from megatron.core import parallel_state as ps
 
-    if ps.get_data_parallel_rank() == 0:
-        shards = [None] * args.tensor_parallel_size
-        dist.all_gather_object(shards, model_tensors(module), group=ps.get_tensor_model_parallel_group())
-        if is_main_process():
-            hf = mcore_to_hf(merge_tp(shards, cfg), cfg)
-            path = save_weights(hf, os.path.join(args.save_dir, f"{args.save_weight}.safetensors"))
-            cfg.save_pretrained(args.save_dir)
-            Logger(f"训练完成，原版格式权重导出至 {path}")
+    payload = None
+    if _is_saver():  # 每个 (PP,TP,EP) 位置只取一份
+        payload = ((ps.get_pipeline_model_parallel_rank(), ps.get_tensor_model_parallel_rank(),
+                    ps.get_expert_model_parallel_rank()), model_tensors(module))
+    gathered = [None] * dist.get_world_size() if is_main_process() else None
+    dist.gather_object(payload, gathered, dst=0)
+    if is_main_process():
+        grid = {}
+        for item in gathered:
+            if item is not None:
+                (pp, tp, ep), sd = item
+                grid.setdefault(pp, {}).setdefault(tp, {})[ep] = sd
+        stages = []
+        for pp in sorted(grid):
+            tps = [grid[pp][t] for t in sorted(grid[pp])]
+            stages.append(merge_parallel([[row[e] for e in sorted(row)] for row in tps], cfg))
+        hf = mcore_to_hf(merge_pp(stages, cfg), cfg)
+        path = save_weights(hf, os.path.join(args.save_dir, f"{args.save_weight}.safetensors"))
+        cfg.save_pretrained(args.save_dir)
+        Logger(f"训练完成，原版格式权重导出至 {path}")
     dist.barrier()
 
 
 # ---------------------------------------------------------------------------
 # 训练
 # ---------------------------------------------------------------------------
+
+
+def _check_parallel_args(args, cfg_n_experts):
+    """并行方式的合法性检查（在初始化进程组之前给出明确报错）。"""
+    tp, pp, ep = args.tensor_parallel_size, args.pipeline_parallel_size, args.expert_parallel_size
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    if pp not in (1, 2):
+        raise ValueError("--pipeline_parallel_size 只能是 1 或 2：循环块与 Coda 必须在同一段内完整跑完所有圈")
+    if args.num_key_value_heads % tp:
+        raise ValueError(f"--tensor_parallel_size {tp} 必须能整除 num_key_value_heads={args.num_key_value_heads}")
+    if ep > 1 and cfg_n_experts % ep:
+        raise ValueError(f"--expert_parallel_size {ep} 必须能整除 n_experts={cfg_n_experts}")
+    if world % (tp * pp * ep):
+        raise ValueError(f"WORLD_SIZE={world} 必须能被 tp×pp×ep={tp * pp * ep} 整除（余下的为数据并行）")
 
 
 def main():
@@ -192,8 +244,10 @@ def main():
     args = parser.parse_args()
     if args.cpu_smoke:
         args.bf16 = 0
+    _check_parallel_args(args, args.n_experts)
 
-    init_parallel(args.tensor_parallel_size, seed=args.seed, cpu=bool(args.cpu_smoke))
+    init_parallel(args.tensor_parallel_size, args.expert_parallel_size, args.pipeline_parallel_size,
+                  seed=args.seed, cpu=bool(args.cpu_smoke))
     from megatron.core import parallel_state as ps
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -206,8 +260,11 @@ def main():
     device = torch.device("cpu") if cpu_smoke_mode() else torch.device("cuda", torch.cuda.current_device())
 
     # ---- 模型 → Megatron DDP ----
-    model = build_model(cfg, tensor_parallel_size=args.tensor_parallel_size, bf16=bool(args.bf16),
-                        n_loops_train=n_loops, grad_checkpoint=bool(args.grad_checkpoint))
+    model = build_model(cfg, tensor_parallel_size=args.tensor_parallel_size,
+                        expert_parallel_size=args.expert_parallel_size,
+                        pipeline_parallel_size=args.pipeline_parallel_size, bf16=bool(args.bf16),
+                        n_loops_train=n_loops, grad_checkpoint=bool(args.grad_checkpoint),
+                        moe_dispatcher=args.moe_dispatcher)
     model.enable_grad_checkpointing(bool(args.grad_checkpoint))
     if args.from_weight != "none" and not args.from_resume:
         load_hf_weights(args, cfg, model)
@@ -268,6 +325,9 @@ def main():
     def forward_step(data_iterator, model_chunk):
         x, y = next(data_iterator)
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        if not unwrapped.post_process:  # 第一段：输出隐状态交给下一段，loss 由最后一段计算
+            hidden = model_chunk(x, labels=y, n_loops=n_loops)
+            return hidden, functools.partial(loss_func, None)
         token_loss, loss_mask = model_chunk(x, labels=y, n_loops=n_loops)
         return token_loss, functools.partial(loss_func, loss_mask.float())
 
@@ -301,12 +361,19 @@ def main():
             step += 1
 
             if step % args.log_interval == 0 or step == total:
-                vals = torch.tensor([sum(float(d[k]) for d in logs) / len(logs) for k in ("loss", "ponder")],
-                                    device=device)
-                dist.all_reduce(vals, group=ps.get_data_parallel_group())
-                vals /= dp_size
-                rho = unwrapped.recurrent.injection.get_A().max().item()
-                loops = float(unwrapped.recurrent.avg_loops)
+                # 统计量只在最后一段产生：先在 DP 组内平均，再广播到整个流水线组（使第 0 号 rank 也能打印、记录）
+                stats = torch.zeros(4, device=device)  # loss, ponder, rho(A), avg_loops
+                if logs:
+                    pair = torch.tensor([sum(float(d[k]) for d in logs) / len(logs) for k in ("loss", "ponder")],
+                                        device=device)
+                    dist.all_reduce(pair, group=ps.get_data_parallel_group())
+                    stats[:2] = pair / dp_size
+                    stats[2] = unwrapped.recurrent.injection.get_A().max().item()
+                    stats[3] = float(unwrapped.recurrent.avg_loops)
+                if args.pipeline_parallel_size > 1:
+                    dist.broadcast(stats, src=ps.get_pipeline_model_parallel_last_rank(),
+                                   group=ps.get_pipeline_model_parallel_group())
+                vals, rho, loops = stats[:2], float(stats[2]), float(stats[3])
                 elapsed = time.time() - t0
                 eta = elapsed / max(step - step0, 1) * (total - step) / 60
                 gn = float(grad_norm) if grad_norm is not None else float("nan")

@@ -479,7 +479,7 @@ wandb sync out/wandb/offline-run-*
 
 ## Megatron-core 版训练
 
-`scripts/pretrain_mcore.py` 用 Megatron-core 重写了预训练，支持**张量并行**（自动开启序列并行）、Megatron DDP 和分布式优化器。
+`scripts/pretrain_mcore.py` 用 Megatron-core 重写了预训练，支持**张量并行**（自动开启序列并行）、**专家并行**（`--expert_parallel_size`）、**流水线并行**（`--pipeline_parallel_size`，2 段）、**MLA 注意力**（`--attn_type mla`）、Megatron DDP 和分布式优化器。
 模型结构、数据、超参与原版完全一致，训练结束导出原版格式的 `pretrain.safetensors`，`eval.py`、`demo.py`、`sft.py` 可以直接使用。
 
 ```bash
@@ -488,9 +488,9 @@ torchrun --nproc_per_node 8 scripts/pretrain_mcore.py --data data/pretrain.bin .
     --tensor_parallel_size 2 --use_distributed_optimizer 1 --bf16 1
 ```
 
-在 CPU 冒烟测试中（`python tests/test_mcore.py`），同一初始权重下，TP=1、TP=2、DP=2 以及中断续训的每步 loss 都与原版 `pretrain.py` 一致。
+在 CPU 冒烟测试中（`python tests/test_mcore.py`），同一初始权重下，TP=1、TP=2、DP=2、EP=2、PP=2 以及中断续训的每步 loss 都与原版 `pretrain.py` 一致（GQA 与 MLA 两种注意力都覆盖）。
 实现对照、参数、验证结果和限制见 **[docs/megatron_core.md](docs/megatron_core.md)**。
-注意：开发环境没有 GPU，bf16 和分布式优化器路径还没有在 GPU 上运行过。
+注意：开发环境没有 GPU，bf16、分布式优化器、NCCL 通信与 `--moe_dispatcher alltoall` 还没有在 GPU 上运行过。
 
 ---
 
@@ -658,13 +658,13 @@ BaiZe/
 │   ├── trainer.py             # 通用训练循环：warmup / 续训 / DDP / FSDP2 / 激活重计算
 │   ├── benchmarks.py          # 标准评测：ARC / MMLU / C-Eval / HellaSwag / GSM8K / 本地 jsonl
 │   ├── trainer_utils.py       # LR schedule / 分布式初始化 / 日志 / 权重 IO（严格校验）
-│   └── mcore/                 # Megatron-core 版：model.py（TP/SP 组件实现的 RDT）、convert.py（权重互转 / TP 切分）、compat.py
+│   └── mcore/                 # Megatron-core 版：model.py（TP/SP/EP/PP 组件实现的 RDT，GQA/MLA）、convert.py（权重互转 / TP·EP·PP 切分）、compat.py
 ├── scripts/
 │   ├── prepare_allenai.py     # AllenAI 预训练 / SFT / 偏好数据流式下载、混合、过滤、配额控制
 │   ├── train_tokenizer.py     # BPE 分词器训练
 │   ├── tokenize_corpus.py     # 预分词 → memmap .bin（大语料训练用）
 │   ├── pretrain.py            # 预训练
-│   ├── pretrain_mcore.py      # 预训练（Megatron-core：张量并行 / Megatron DDP / 分布式优化器）
+│   ├── pretrain_mcore.py      # 预训练（Megatron-core：TP / EP / PP / MLA / Megatron DDP / 分布式优化器）
 │   ├── sft.py                 # 指令微调（prompt mask / 多轮对话）
 │   ├── dpo.py                 # 偏好对齐（DPO）
 │   ├── eval.py                # 困惑度 / 对话 / 标准评测（支持 --loops 深度外推）

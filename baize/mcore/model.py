@@ -25,6 +25,7 @@ LTI / LoRA / ACT / 圈数嵌入  直接复用原版模块（参数在张量并�
 
 import dataclasses
 import functools
+import math
 
 import torch
 import torch.nn as nn
@@ -38,10 +39,11 @@ from megatron.core import tensor_parallel  # noqa: E402
 from megatron.core.enums import ModelType  # noqa: E402
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding  # noqa: E402
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec  # noqa: E402
-from megatron.core.transformer.module import MegatronModule  # noqa: E402
+from megatron.core.models.common.language_module.language_module import LanguageModule  # noqa: E402
 from megatron.core.transformer.spec_utils import build_module  # noqa: E402
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules  # noqa: E402
-from megatron.core.transformer.transformer_config import TransformerConfig  # noqa: E402
+from megatron.core.transformer.identity_op import IdentityOp  # noqa: E402
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig  # noqa: E402
 
 from ..model import ACTHalting, LoRAAdapter, LTIInjection, loop_index_embedding  # noqa: E402
 
@@ -51,9 +53,12 @@ from ..model import ACTHalting, LoRAAdapter, LTIInjection, loop_index_embedding 
 # ---------------------------------------------------------------------------
 
 
-def build_transformer_configs(cfg, *, tensor_parallel_size=1, expert_parallel_size=1, bf16=False,
-                              n_loops_train=None, grad_checkpoint=False, moe_dispatcher="allgather"):
+def build_transformer_configs(cfg, *, tensor_parallel_size=1, expert_parallel_size=1, pipeline_parallel_size=1,
+                              bf16=False, n_loops_train=None, grad_checkpoint=False, moe_dispatcher="allgather"):
     """返回 (dense_cfg, moe_cfg)。
+
+    pipeline_parallel_size 只能是 1 或 2（两段：词嵌入+Prelude | 循环块+Coda+输出层）。
+    moe_dispatcher：'allgather'（CPU 可测）或 'alltoall'（EP 下通信更省，CPU 上 torch 2.14 的 all_to_all 参数类型不兼容，未测）。
 
     dense_cfg —— Prelude / Coda（use_moe=False 时为稠密 SwiGLU）
     moe_cfg   —— 循环块（恒为 MoE）；Prelude/Coda 的 use_moe=True 时也用它
@@ -61,17 +66,18 @@ def build_transformer_configs(cfg, *, tensor_parallel_size=1, expert_parallel_si
     MoE aux-loss：Megatron 的 MoELayer 每调用一次就把 coeff·aux 挂到反向图上，循环块每圈调用一次，
     所以系数除以训练圈数，等价于原版"各圈 aux 取平均再乘系数"。
     """
-    if cfg.attn_type != "gqa":
-        raise NotImplementedError("Megatron-core 版目前只实现 GQA（attn_type='gqa'）；MLA 请用原版训练")
     if cfg.hidden_act != "silu":
         raise NotImplementedError("Megatron-core 版只实现 SwiGLU（hidden_act='silu'）")
     n_loops = n_loops_train or cfg.max_loop_iters
+    mla = cfg.attn_type == "mla"
     dtype = torch.bfloat16 if bf16 else torch.float32
     common = dict(
         num_layers=1,
         hidden_size=cfg.hidden_size,
         num_attention_heads=cfg.num_attention_heads,
         num_query_groups=cfg.num_key_value_heads or cfg.num_attention_heads,
+        # GQA 用 QK-norm；MLA 的 q/kv 归一化作用在压缩隐变量上（见 _layer_spec）
+        
         kv_channels=cfg.head_dim,
         ffn_hidden_size=cfg.intermediate_size,
         normalization="RMSNorm",
@@ -88,7 +94,7 @@ def build_transformer_configs(cfg, *, tensor_parallel_size=1, expert_parallel_si
         params_dtype=dtype,
         pipeline_dtype=dtype,
         tensor_model_parallel_size=tensor_parallel_size,
-        expert_model_parallel_size=expert_parallel_size,
+        pipeline_model_parallel_size=pipeline_parallel_size,
         sequence_parallel=tensor_parallel_size > 1,  # Megatron 要求 MoE + TP 时开启；层间隐状态沿序列切分
         use_cpu_initialization=cpu_smoke_mode(),
         gradient_accumulation_fusion=False,
@@ -97,6 +103,11 @@ def build_transformer_configs(cfg, *, tensor_parallel_size=1, expert_parallel_si
         persist_layer_norm=False,
         apply_rope_fusion=False,
     )
+    if mla:
+        # Megatron MLA：RoPE 只作用于 qk_pos_emb_head_dim 维，频率由 rotary_base 决定（与原版 rope_theta 一致）
+        common.update(multi_latent_attention=True, q_lora_rank=cfg.q_lora_rank, kv_lora_rank=cfg.kv_lora_rank,
+                      qk_head_dim=cfg.qk_nope_head_dim, qk_pos_emb_head_dim=cfg.qk_rope_head_dim,
+                      v_head_dim=cfg.v_head_dim, rotary_base=cfg.rope_theta, rope_type="rope", rotary_percent=1.0)
     if grad_checkpoint:
         common.update(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)
     moe = dict(
@@ -111,9 +122,11 @@ def build_transformer_configs(cfg, *, tensor_parallel_size=1, expert_parallel_si
         moe_grouped_gemm=False,
         moe_router_dtype="fp32",
         moe_expert_capacity_factor=cfg.moe_capacity_factor if cfg.moe_capacity_factor > 0 else None,
+        expert_model_parallel_size=expert_parallel_size,  # 专家并行只作用于 MoE 层（稠密层的参数在 EP 组内复制）
     )
-    dense_cfg = TransformerConfig(**common)
-    moe_cfg = TransformerConfig(**common, **moe)
+    Cls = MLATransformerConfig if mla else TransformerConfig
+    dense_cfg = Cls(**common)
+    moe_cfg = Cls(**common, **moe)
     return dense_cfg, moe_cfg
 
 
@@ -134,19 +147,60 @@ class RMSNormSP(nn.RMSNorm):
             self.weight.sequence_parallel = True  # 梯度在 TP 组内求和（finalize_model_grads）
 
 
-def _layer_spec(use_moe: bool, num_experts: int):
+class MLACoreAttention(nn.Module):
+    """MLA 的核心注意力：qk 维（nope+rope）与 v 维不同，本地 DotProductAttention 不支持，这里用 SDPA 实现。
+
+    输入 query/key: [s, b, H, qk]，value: [s, b, H, v]；输出 [s, b, H·v]（与 MLA 的 linear_proj 对接）。
+    attention_mask 与其它模块一致：True = 屏蔽。
+    """
+
+    def __init__(self, config, layer_number=None, attn_mask_type=None, attention_type=None, softmax_scale=None,
+                 k_channels=None, v_channels=None, cp_comm_type=None, pg_collection=None, **kwargs):
+        super().__init__()
+        self.dropout_p = config.attention_dropout
+        self.rope_dim = config.qk_pos_emb_head_dim
+        if softmax_scale is None:  # 基类传入的是 config.softmax_scale（None）：按 MLA 的 qk 维（nope+rope）计算
+            k_channels = k_channels or (config.qk_head_dim + config.qk_pos_emb_head_dim)
+            softmax_scale = 1.0 / math.sqrt(k_channels)
+        self.softmax_scale = softmax_scale
+
+    def forward(self, query, key, value, attention_mask, attn_mask_type=None, packed_seq_params=None, **kwargs):
+        if packed_seq_params is not None:
+            raise NotImplementedError("MLA 核心注意力不支持 packed sequence")
+        # 共享的 RoPE key（各头相同，已在 Megatron 里 expand 到本 rank 的头数）。它的梯度要在 TP 组内求和：
+        # 每个 rank 只带着自己的头参与注意力，直接反传会得到部分和。只保留一个头、过 copy_to（反向 all-reduce）再 expand，
+        # 前向数值不变，反向得到"本地头求和 → 跨 TP 求和"的完整梯度。
+        r = self.rope_dim
+        k_nope, k_rope = key[..., :-r], key[..., -r:]
+        k_rope = tensor_parallel.copy_to_tensor_model_parallel_region(k_rope[:, :, :1]).expand_as(k_rope)
+        key = torch.cat([k_nope, k_rope], dim=-1)
+        q, k, v = (t.permute(1, 2, 0, 3) for t in (query, key, value))            # [b, H, s, d]
+        drop = self.dropout_p if self.training else 0.0
+        if attention_mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.softmax_scale, dropout_p=drop)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=~attention_mask, scale=self.softmax_scale,
+                                                 dropout_p=drop)
+        b, H, s, dv = out.shape
+        return out.permute(2, 0, 1, 3).reshape(s, b, H * dv)
+
+
+def _layer_spec(use_moe: bool, num_experts: int, mla: bool = False):
     spec = get_gpt_layer_local_spec(num_experts=num_experts if use_moe else None, moe_grouped_gemm=False,
-                                    qk_layernorm=True, normalization="RMSNorm")
+                                    qk_layernorm=True, multi_latent_attention=mla, normalization="RMSNorm")
     sub = spec.submodules
     attn = sub.self_attention
-    attn = dataclasses.replace(attn, submodules=dataclasses.replace(
-        attn.submodules, q_layernorm=RMSNormSP, k_layernorm=RMSNormSP))
+    norms = {k: RMSNormSP for k in ("q_layernorm", "k_layernorm", "kv_layernorm")
+             if hasattr(attn.submodules, k) and getattr(attn.submodules, k) is not IdentityOp}
+    if mla:
+        norms["core_attention"] = MLACoreAttention
+    attn = dataclasses.replace(attn, submodules=dataclasses.replace(attn.submodules, **norms))
     sub = dataclasses.replace(sub, input_layernorm=RMSNormSP, pre_mlp_layernorm=RMSNormSP, self_attention=attn)
     return dataclasses.replace(spec, submodules=sub)
 
 
-def _block_spec(use_moe: bool, num_experts: int, num_layers: int):
-    return TransformerBlockSubmodules(layer_specs=[_layer_spec(use_moe, num_experts)] * num_layers,
+def _block_spec(use_moe: bool, num_experts: int, num_layers: int, mla: bool = False):
+    return TransformerBlockSubmodules(layer_specs=[_layer_spec(use_moe, num_experts, mla)] * num_layers,
                                       layer_norm=RMSNormSP)
 
 
@@ -180,7 +234,7 @@ class MCoreRecurrentBlock(nn.Module):
     def __init__(self, cfg, moe_cfg: TransformerConfig):
         super().__init__()
         self.cfg = cfg
-        layer = build_module(_layer_spec(True, cfg.n_experts), config=moe_cfg, layer_number=1)
+        layer = build_module(_layer_spec(True, cfg.n_experts, cfg.attn_type == "mla"), config=moe_cfg, layer_number=1)
         self.attn_norm = layer.input_layernorm
         self.self_attention = layer.self_attention
         self.ffn_norm = layer.pre_mlp_layernorm
@@ -269,45 +323,88 @@ class MCoreRecurrentBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class BaiZeMCoreModel(MegatronModule):
-    """Megatron-core 版 BaiZe 因果语言模型。
+class BaiZeMCoreModel(LanguageModule):
+    """Megatron-core 版 BaiZe 因果语言模型（支持 TP / SP / EP / 两段式 PP）。
+
+    流水线（PP=2）：第一段 = 词嵌入 + Prelude（输出 e，即循环块的注入信号）；第二段 = 循环块 + Coda + 输出层。
+    循环块必须整体在一段内迭代，所以 PP 最多两段。词嵌入与输出层的权重绑定（tie）沿用 Megatron 的
+    LanguageModule 机制：第二段持有一份词嵌入副本，初始化时同步，梯度在 embd 组内 all-reduce。
 
     forward(input_ids [b, s], labels [b, s] = None, n_loops=None)
-        labels 为空：返回 logits [b, s, vocab]（TP>1 时为本 rank 的词表分片，已去掉 padding 列）
-        labels 非空：返回 (token_loss [b, s], loss_mask [b, s])；labels 与 input 对齐（模型内部做 shift），
-                     -100 处不计 loss
+        labels 为空：返回 logits [b, s, vocab]（TP>1 时为本 rank 的词表分片，已去掉 padding 列；只在最后一段有效）
+        labels 非空：返回 (token_loss [b, s], loss_mask [b, s])；labels 与 input 对齐（模型内部做 shift）
+        非最后一段：返回的是送给下一段的隐状态（由流水线调度接收），不是 loss
     """
 
-    def __init__(self, cfg, dense_cfg: TransformerConfig, moe_cfg: TransformerConfig):
-        super().__init__(config=moe_cfg)  # schedules 通过 model.config 读取 MoE / 梯度同步设置
+    def __init__(self, cfg, dense_cfg: TransformerConfig, moe_cfg: TransformerConfig, pre_process=True,
+                 post_process=True):
+        super().__init__(config=moe_cfg)  # schedules 通过 model.config 读取 MoE / 梯度同步 / PP 设置
         self.model_type = ModelType.encoder_or_decoder
         self.cfg = cfg
+        self.pre_process, self.post_process = pre_process, post_process
+        self.share_embeddings_and_output_weights = cfg.tie_word_embeddings
+        self.input_tensor = None
         self.vocab_padded = padded_vocab_size(cfg.vocab_size, dense_cfg.tensor_model_parallel_size)
-        self.embedding = LanguageModelEmbedding(
-            config=dense_cfg, vocab_size=self.vocab_padded, max_sequence_length=cfg.max_position_embeddings,
-            position_embedding_type="rope")
-        # Prelude / Coda 的 MoE 每次前向只调用一次：aux 系数用原值（循环块的 moe_cfg 已按圈数均摊）
-        side_cfg = (dataclasses.replace(moe_cfg, moe_aux_loss_coeff=cfg.router_aux_loss_coef) if cfg.use_moe
-                    else dense_cfg)
-        self.prelude = (TransformerBlock(dataclasses.replace(side_cfg, num_layers=cfg.prelude_layers),
-                                         _block_spec(cfg.use_moe, cfg.n_experts, cfg.prelude_layers),
-                                         post_layer_norm=False) if cfg.prelude_layers > 0 else None)
-        self.recurrent = MCoreRecurrentBlock(cfg, moe_cfg)
-        # Coda 的 final_layernorm 即原版 BaiZeModel.norm（coda_layers=0 时单独建一个 norm）
-        self.coda = (TransformerBlock(dataclasses.replace(side_cfg, num_layers=cfg.coda_layers),
-                                      _block_spec(cfg.use_moe, cfg.n_experts, cfg.coda_layers),
-                                      post_layer_norm=True) if cfg.coda_layers > 0 else None)
-        self.final_norm = None if self.coda is not None else RMSNormSP(dense_cfg, cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.output_layer = tensor_parallel.ColumnParallelLinear(
-            cfg.hidden_size, self.vocab_padded, config=dense_cfg, init_method=dense_cfg.init_method, bias=False,
-            skip_bias_add=False, gather_output=False,
-            skip_weight_param_allocation=cfg.tie_word_embeddings)
-        self._init_rdt_params()
-        if moe_cfg.sequence_parallel:
-            # 这些参数在 TP 组内复制、作用在本 rank 的序列分片上：梯度需要在 TP 组内求和
-            for mod in (self.recurrent.injection, self.recurrent.act, self.recurrent.lora):
-                for p in mod.parameters():
-                    p.sequence_parallel = True
+        mla = cfg.attn_type == "mla"
+        self.mla = mla
+        # 子块各自只在一段内构建，不能再被流水线切分：num_layers 必须是本段的完整层数
+        sub = lambda c, n: dataclasses.replace(c, num_layers=n, pipeline_model_parallel_size=1)
+
+        if pre_process:
+            self.embedding = LanguageModelEmbedding(
+                config=dense_cfg, vocab_size=self.vocab_padded, max_sequence_length=cfg.max_position_embeddings,
+                position_embedding_type="rope")
+            # Prelude / Coda 的 MoE 每次前向只调用一次：aux 系数用原值（循环块的 moe_cfg 已按圈数均摊）
+            side_cfg = (dataclasses.replace(moe_cfg, moe_aux_loss_coeff=cfg.router_aux_loss_coef) if cfg.use_moe
+                        else dense_cfg)
+            self.prelude = (TransformerBlock(sub(side_cfg, cfg.prelude_layers),
+                                             _block_spec(cfg.use_moe, cfg.n_experts, cfg.prelude_layers, mla),
+                                             post_layer_norm=False, pre_process=True, post_process=False)
+                            if cfg.prelude_layers > 0 else None)
+        else:
+            self.embedding, self.prelude = None, None
+
+        if post_process:
+            side_cfg = (dataclasses.replace(moe_cfg, moe_aux_loss_coeff=cfg.router_aux_loss_coef) if cfg.use_moe
+                        else dense_cfg)
+            self.recurrent = MCoreRecurrentBlock(cfg, moe_cfg)
+            # Coda 的 final_layernorm 即原版 BaiZeModel.norm（coda_layers=0 时单独建一个 norm）
+            self.coda = (TransformerBlock(sub(side_cfg, cfg.coda_layers),
+                                          _block_spec(cfg.use_moe, cfg.n_experts, cfg.coda_layers, mla),
+                                          post_layer_norm=True, pre_process=True, post_process=True)
+                         if cfg.coda_layers > 0 else None)
+            self.final_norm = (None if self.coda is not None
+                               else RMSNormSP(dense_cfg, cfg.hidden_size, eps=cfg.rms_norm_eps))
+            # 与 GPTModel 相同：只有同时持有词嵌入的那一段才跳过输出层权重分配（直接用词嵌入权重）
+            self.output_layer = tensor_parallel.ColumnParallelLinear(
+                cfg.hidden_size, self.vocab_padded, config=dense_cfg, init_method=dense_cfg.init_method, bias=False,
+                skip_bias_add=False, gather_output=False,
+                skip_weight_param_allocation=pre_process and cfg.tie_word_embeddings)
+        else:
+            self.recurrent, self.coda, self.final_norm, self.output_layer = None, None, None, None
+
+        if post_process:
+            self._init_rdt_params()
+            if moe_cfg.sequence_parallel:
+                # 这些参数在 TP 组内复制、作用在本 rank 的序列分片上：梯度需要在 TP 组内求和
+                for mod in (self.recurrent.injection, self.recurrent.act, self.recurrent.lora):
+                    for p in mod.parameters():
+                        p.sequence_parallel = True
+        # 词嵌入 / 输出层权重绑定的初始化与梯度同步（Megatron LanguageModule）
+        if pre_process or post_process:
+            self.setup_embeddings_and_output_layer()
+        if cfg.use_moe:
+            self._reserve_aux_loss_tracker(max(cfg.prelude_layers, cfg.coda_layers, 1))
+
+    def _reserve_aux_loss_tracker(self, n_slots):
+        """Megatron 的 MoE aux-loss 追踪表是进程内全局的，第一次写入时按那个 block 的层数定尺寸。
+        prelude / 循环块（1 层）/ coda 各自从第 1 层编号，先按最大层数定好尺寸，避免 coda 比 prelude 深或
+        流水线第二段先写入时越界。该表只用于日志统计，不影响 loss 与梯度。"""
+        from megatron.core.transformer.moe.moe_utils import get_moe_layer_wise_logging_tracker
+
+        tracker = get_moe_layer_wise_logging_tracker()
+        device = next(self.parameters()).device
+        tracker.setdefault("load_balancing_loss", {})["values"] = torch.zeros(n_slots, device=device)
 
     @torch.no_grad()
     def _init_rdt_params(self):
@@ -318,24 +415,32 @@ class BaiZeMCoreModel(MegatronModule):
         self.recurrent.act.halt.bias.fill_(self.cfg.act_init_bias)
 
     def set_input_tensor(self, input_tensor):
-        """流水线并行接口（本模型只支持 PP=1，无需处理）。"""
+        """流水线调度在非第一段调用：把上一段的输出作为本段输入。"""
+        if isinstance(input_tensor, (list, tuple)):
+            input_tensor = input_tensor[0]
+        self.input_tensor = input_tensor
 
     def enable_grad_checkpointing(self, enabled: bool = True):
-        self.recurrent.grad_checkpointing = enabled
-
-    def shared_embedding_or_output_weight(self):
-        return self.embedding.word_embeddings.weight
+        if self.recurrent is not None:
+            self.recurrent.grad_checkpointing = enabled
 
     def forward(self, input_ids, labels=None, n_loops=None):
         b, s = input_ids.shape
         device = input_ids.device
-        position_ids = torch.arange(s, device=device).unsqueeze(0).expand(b, -1)
-        h = self.embedding(input_ids=input_ids, position_ids=position_ids)          # [s, b, h]
-        rotary = rope_freqs(s, self.cfg.head_dim, self.cfg.rope_theta, device)
         mask = causal_mask(s, device)
+        # MLA 自带 RoPE（作用于 qk_rope_head_dim 维），外部不传 rotary
+        rotary = None if self.mla else rope_freqs(s, self.cfg.head_dim, self.cfg.rope_theta, device)
 
-        if self.prelude is not None:
-            h = self.prelude(h, attention_mask=mask, rotary_pos_emb=rotary)
+        if self.pre_process:
+            position_ids = torch.arange(s, device=device).unsqueeze(0).expand(b, -1)
+            h = self.embedding(input_ids=input_ids, position_ids=position_ids)      # [s, b, h]
+            if self.prelude is not None:
+                h = self.prelude(h, attention_mask=mask, rotary_pos_emb=rotary)
+        else:
+            h = self.input_tensor
+        if not self.post_process:
+            return h  # 送给下一段（PP 第二段）
+
         e = h
         h = self.recurrent(h, e, rotary, mask, n_loops=n_loops)
         if self.coda is not None:

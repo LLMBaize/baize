@@ -25,6 +25,13 @@ def apply_compat_patches():
         return
     if not hasattr(moe_utils, "te_general_gemm"):
         moe_utils.te_general_gemm = None
+    # multi_latent_attention 在 TE 缺失时仍把 HAVE_TE 当作真值，随后 isinstance(x, None) 报错
+    import megatron.core.transformer.multi_latent_attention as mla
+
+    import importlib.util
+
+    if importlib.util.find_spec("transformer_engine") is None:  # TE 未安装：megatron 会塞入 MagicMock 占位
+        mla.HAVE_TE = False
 
 
 def enable_cpu_smoke_mode():
@@ -40,6 +47,10 @@ def enable_cpu_smoke_mode():
     torch.cuda.manual_seed = lambda seed: None
     torch.cuda.manual_seed_all = lambda seed: None
     torch.cuda.synchronize = lambda device=None: None
+    torch.cuda.Stream = _FakeStream
+    torch.cuda.Event = _FakeStream
+    torch.cuda.current_stream = lambda device=None: _FakeStream()
+    torch.cuda.stream = lambda stream=None: _FakeStream()
 
     import megatron.core.tensor_parallel.random as mrandom
 
@@ -67,7 +78,26 @@ def enable_cpu_smoke_mode():
                     g.mul_(coeff)
 
     mopt.clip_grad_by_total_norm_fp32 = _clip_cpu
+
+    # LanguageModule.setup_embeddings_and_output_layer 在 PP 下对词嵌入做 weight.data.cuda()：CPU 模式下 Tensor.cuda 是恒等函数
+    torch.Tensor.cuda = lambda self, *a, **k: self
     _CPU_MODE = True
+
+
+class _FakeStream:
+    """CPU 上没有 CUDA stream / event：提供空实现，让 alltoall 分发器等代码路径可以执行。"""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __getattr__(self, name):
+        return lambda *a, **k: _FakeStream()  # record_event() 等返回可再次 synchronize 的对象
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class _CpuTorchProxy:

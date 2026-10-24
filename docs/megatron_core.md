@@ -33,6 +33,15 @@ python scripts/pretrain_mcore.py --data data/pretrain.bin --tokenizer tokenizer 
 torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... \
     --tensor_parallel_size 2 --use_distributed_optimizer 1
 
+# 8 卡：专家并行 4 × 数据并行 2（MoE 专家切到 4 个 rank 上）
+torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... --expert_parallel_size 4
+
+# 4 卡：流水线并行 2 × 数据并行 2（第一段：词嵌入 + Prelude；第二段：循环块 + Coda + 输出层）
+torchrun --nproc_per_node 4 scripts/pretrain_mcore.py ...同上... --pipeline_parallel_size 2
+
+# MLA 注意力（与原版 pretrain.py 的 --attn_type mla 相同），可与上述并行方式任意组合
+torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... --attn_type mla --expert_parallel_size 4
+
 # 中断后续训（原命令加 --from_resume 1）
 torchrun --nproc_per_node 8 scripts/pretrain_mcore.py ...同上... --from_resume 1
 
@@ -45,6 +54,10 @@ python scripts/pretrain_mcore.py ... --from_weight pretrain
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--tensor_parallel_size` | 1 | 张量并行度。>1 时自动开启**序列并行**（Megatron 要求 MoE + TP 必须开）；要求能整除 `num_key_value_heads` |
+| `--expert_parallel_size` | 1 | 专家并行度。每个 EP rank 持有 `n_experts / EP` 个专家（要求整除）；dense 部分仍在 DP 组内复制 |
+| `--pipeline_parallel_size` | 1 | 流水线并行度，**只支持 1 或 2**。两段：词嵌入 + Prelude | 循环块 + Coda + 输出层；循环块的全部圈数都在同一段内完成。词嵌入与输出层权重在两段之间绑定并同步梯度 |
+| `--moe_dispatcher` | allgather | MoE token 分发方式：`allgather`（CPU 冒烟可测）或 `alltoall`（EP 通信更省；仅 GPU 上可用，CPU 冒烟未测） |
+| `--attn_type` | gqa | `gqa` 或 `mla`（与原版相同）。MLA 的 `kv_lora_rank` / `q_lora_rank` / `qk_*_head_dim` / `v_head_dim` 使用 `BaiZeConfig` 的默认值 |
 | `--use_distributed_optimizer` | 0 | 优化器状态在 DP 组内切分（ZeRO-1） |
 | `--batch_size` | 8 | 每个 DP rank 的 micro-batch 大小；每步样本数 = batch_size × accumulation_steps × DP |
 | `--bf16` | 1 | bf16 计算 + fp32 主权重；`--cpu_smoke 1` 时强制关闭 |
@@ -54,12 +67,18 @@ python scripts/pretrain_mcore.py ... --from_weight pretrain
 | `--cpu_smoke` | 0 | 无 GPU 的冒烟测试：CPU + gloo（见下文） |
 | `--use_wandb` 等 | — | 与原版相同 |
 
+并行参数会在启动前检查：`pipeline_parallel_size` 只能是 1 或 2；`tensor_parallel_size` 要能整除 `num_key_value_heads`；
+`expert_parallel_size` 要能整除 `n_experts`；`WORLD_SIZE` 要能被 `tp × pp × ep` 整除。
+
+断点与导出都按 `(TP, EP, PP)` 坐标拆分：每个坐标只由一个 rank 写文件（专家参数在 expert-DP 组内复制，所以取 expert-DP rank 0），
+因此 EP / PP 的断点和导出权重都是完整的。续训时并行方式必须与保存时一致（`latest.json` 里记录了 tp / ep / pp）。
+
 产物：
 
 ```
 out/mcore_ckpt_pretrain/latest.json              # 指向最新的完整断点
-out/mcore_ckpt_pretrain/step_0001000/tp00.pt     # 每个 TP 分片一份（模型 + 优化器 + 步数）
-out/mcore_ckpt_pretrain/step_0001000/tp00_distopt.pt   # 分布式优化器的参数状态
+out/mcore_ckpt_pretrain/step_0001000/tp00_ep00_pp00.pt   # 每个 (TP, EP, PP) 坐标一份（模型 + 优化器 + 步数）
+out/mcore_ckpt_pretrain/step_0001000/tp00_ep00_pp00_distopt.pt   # 分布式优化器的参数状态
 out/pretrain.safetensors + out/config.json       # 训练结束导出的原版格式权重（合并 TP 分片、去掉词表 padding）
 ```
 
@@ -89,7 +108,7 @@ out/pretrain.safetensors + out/config.json       # 训练结束导出的原版�
 
 ## 验证
 
-`python tests/test_mcore.py` 运行以下全部检查，CI 里也有单独的 `megatron-core` job。
+`python tests/test_mcore.py` 运行以下全部检查（GQA 与 MLA 两种注意力），CI 里也有单独的 `megatron-core` job。
 
 | 检查 | 结果 |
 |---|---|
@@ -99,6 +118,9 @@ out/pretrain.safetensors + out/config.json       # 训练结束导出的原版�
 | 同一初始权重、同一数据顺序训练，对比原版 `pretrain.py` 的 loss 轨迹 | TP=1、TP=2（序列并行）、DP=2、激活重计算、中断续训（TP=1 / TP=2）：每步 loss 与原版相同（4 位小数） |
 | ACT 延后启用 + 提前停机，TP=2 | TP=1 与 TP=2 完全一致；与原版相差约 1e-4，原因见下方"已知差异" |
 | TP=2 训练后导出的权重 | 与 TP=1 导出的一致（fp16 存盘误差约 3e-5），可严格加载进原版模型，`eval.py` 正常运行 |
+| 流水线并行 PP=2 | loss 与原版逐步一致；导出权重与 TP=1 一致（3e-5）；中断续训与不中断一致 |
+| 专家并行 EP=2 | loss 与 DP=2（同 batch）一致；导出权重与 DP=2 一致（3e-5）；中断续训与不中断一致 |
+| MLA（`--attn_type mla`） | TP=1 与原版 loss 一致；TP=2 / PP=2 / EP=2 与 TP=1 一致（权重 3e-5）；与原版的层级输出误差约 1e-7 |
 
 ### 已知差异
 
@@ -115,10 +137,12 @@ out/pretrain.safetensors + out/config.json       # 训练结束导出的原版�
 - **没有在 GPU 上运行过**：开发环境没有 GPU，上面的验证都是在 CPU + gloo 的冒烟模式下完成的。以下几项在 CPU 上无法测试，请在 GPU 上先用 `--max_steps 50` 小规模确认：
   - bf16 训练路径；
   - 分布式优化器（Megatron 的 `DistributedOptimizer` 只接受 CUDA 张量）；
-  - NCCL 通信。
+  - NCCL 通信；
+  - `--moe_dispatcher alltoall`：CPU 上 torch 的 `all_to_all_single` 与 megatron-core 0.16.1 的参数类型不兼容，只能在 GPU 上用。
 - **CPU 冒烟模式**（`--cpu_smoke 1`）：megatron-core 有约 50 处写死了 CUDA 设备、RNG 和梯度裁剪的断言。冒烟模式把这些调用重定向到 CPU，只用于测试和 CI。GPU 上不要开启，检测到 GPU 时会直接报错。
-- **不支持流水线并行**：循环块需要在同一个 stage 内迭代 T 圈。
-- **不支持 MLA**（`--attn_type mla`）：只实现了 GQA。需要 MLA 请用原版训练。
-- **没有开放专家并行（EP）**：Megatron 支持，但断点保存和权重导出还没有处理专家分片。
+- **流水线并行只支持 2 段**：`--pipeline_parallel_size` 为 1 或 2。循环块在一段内完整迭代 T 圈，所以循环块不能被切开；更多段需要把 Coda 也拆分，目前没有实现。
+- **MLA 的维度不能通过命令行设置**：`kv_lora_rank`、`q_lora_rank`、`qk_nope_head_dim`、`qk_rope_head_dim`、`v_head_dim` 取 `BaiZeConfig` 的默认值（与原版相同）。
+- **MLA 的 RoPE 行顺序**：Megatron 对 RoPE 通道做了去交错，转换时会对 `linear_q_up_proj` 与 `linear_kv_down_proj` 的 RoPE 行做相应的置换（`baize/mcore/convert.py` 的 `_rope_perm`），导出时反置换，所以导出的权重是原版格式。
 - 张量并行度必须能整除 `num_key_value_heads`。
+- 训练步的 MoE 辅助 loss 统计（Megatron 的全局 aux-loss 追踪表）只用于 Megatron 内部日志，训练脚本不读取它；`baize/mcore/model.py` 按最大层数预先定尺寸，避免各子块共用同一张表时越界。
 - SFT / DPO 仍然使用原版 Trainer，可以直接接 Megatron 版导出的 `pretrain.safetensors`。
